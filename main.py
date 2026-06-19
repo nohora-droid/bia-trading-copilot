@@ -8,23 +8,39 @@ from dotenv import load_dotenv
 
 load_dotenv()
 
-SUPABASE_URL = os.environ["SUPABASE_URL"]
-SUPABASE_KEY = os.environ["SUPABASE_KEY"]
-ANTHROPIC_API_KEY = os.environ["ANTHROPIC_API_KEY"]
-SLACK_BOT_TOKEN = os.environ["SLACK_BOT_TOKEN"]
-SLACK_CHANNEL_ID = os.environ["SLACK_CHANNEL_ID"]
-
-supabase: Client = create_client(SUPABASE_URL, SUPABASE_KEY)
-claude = anthropic.Anthropic(api_key=ANTHROPIC_API_KEY)
+SUPABASE_URL = os.getenv("SUPABASE_URL", "")
+SUPABASE_KEY = os.getenv("SUPABASE_KEY", "")
+ANTHROPIC_API_KEY = os.getenv("ANTHROPIC_API_KEY", "")
+SLACK_BOT_TOKEN = os.getenv("SLACK_BOT_TOKEN", "")
+SLACK_CHANNEL_ID = os.getenv("SLACK_CHANNEL_ID", "")
 
 app = FastAPI(title="BIA AI Trading Copilot")
+
+# Lazy-initialized clients — created on first use so a missing env var
+# doesn't crash the process before Slack's challenge can be answered.
+_supabase: Client | None = None
+_claude: anthropic.Anthropic | None = None
+
+
+def get_supabase() -> Client:
+    global _supabase
+    if _supabase is None:
+        _supabase = create_client(SUPABASE_URL, SUPABASE_KEY)
+    return _supabase
+
+
+def get_claude() -> anthropic.Anthropic:
+    global _claude
+    if _claude is None:
+        _claude = anthropic.Anthropic(api_key=ANTHROPIC_API_KEY)
+    return _claude
 
 # In-memory dedup set — cleared on restart, sufficient for most duplicate scenarios
 processed_events: set[str] = set()
 
 
 async def get_simulation_context() -> str:
-    result = supabase.table("simulation_runs").select("*").order("created_at", desc=True).limit(20).execute()
+    result = get_supabase().table("simulation_runs").select("*").order("created_at", desc=True).limit(20).execute()
     runs = result.data or []
     if not runs:
         return "No hay simulaciones recientes disponibles."
@@ -57,7 +73,7 @@ async def handle_mention(event: dict) -> None:
 
     context = await get_simulation_context()
 
-    message = claude.messages.create(
+    message = get_claude().messages.create(
         model="claude-sonnet-4-6",
         max_tokens=1024,
         system=(
