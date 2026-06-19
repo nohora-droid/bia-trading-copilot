@@ -1,0 +1,406 @@
+<!DOCTYPE html>
+<html lang="es">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>BIA Trading Copilot — Guía de Despliegue</title>
+  <style>
+    *, *::before, *::after { box-sizing: border-box; margin: 0; padding: 0; }
+
+    :root {
+      --bg: #0f1117;
+      --surface: #1a1d27;
+      --surface2: #22263a;
+      --border: #2e3350;
+      --accent: #6c63ff;
+      --accent2: #00d4aa;
+      --warn: #f59e0b;
+      --text: #e2e8f0;
+      --muted: #94a3b8;
+      --code-bg: #0d1117;
+      --railway: #7c3aed;
+      --render: #22c55e;
+    }
+
+    body {
+      font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', system-ui, sans-serif;
+      background: var(--bg);
+      color: var(--text);
+      line-height: 1.6;
+      padding: 2rem 1rem;
+    }
+
+    .container { max-width: 860px; margin: 0 auto; }
+
+    header {
+      border-bottom: 1px solid var(--border);
+      padding-bottom: 1.5rem;
+      margin-bottom: 2.5rem;
+    }
+
+    .badge {
+      display: inline-block;
+      font-size: 0.7rem;
+      font-weight: 700;
+      letter-spacing: .08em;
+      text-transform: uppercase;
+      padding: .25rem .6rem;
+      border-radius: 4px;
+      margin-bottom: .75rem;
+      background: var(--accent);
+      color: #fff;
+    }
+
+    h1 { font-size: 1.75rem; font-weight: 700; color: #fff; margin-bottom: .4rem; }
+    h2 { font-size: 1.15rem; font-weight: 700; color: #fff; margin-bottom: 1rem; }
+    h3 { font-size: .95rem; font-weight: 600; color: var(--text); margin-bottom: .6rem; }
+
+    p { color: var(--muted); margin-bottom: .75rem; }
+
+    .subtitle { font-size: 1rem; color: var(--muted); }
+
+    /* Step list */
+    .steps { display: flex; flex-direction: column; gap: 1.5rem; margin-bottom: 2.5rem; }
+
+    .step {
+      display: grid;
+      grid-template-columns: 2.5rem 1fr;
+      gap: 1rem;
+      align-items: start;
+    }
+
+    .step-num {
+      width: 2.5rem; height: 2.5rem;
+      border-radius: 50%;
+      background: var(--accent);
+      color: #fff;
+      font-weight: 700;
+      font-size: .9rem;
+      display: flex; align-items: center; justify-content: center;
+      flex-shrink: 0;
+      margin-top: .1rem;
+    }
+
+    .step-body { background: var(--surface); border: 1px solid var(--border); border-radius: 10px; padding: 1.25rem; }
+
+    /* Code blocks */
+    pre {
+      background: var(--code-bg);
+      border: 1px solid var(--border);
+      border-radius: 8px;
+      padding: 1rem 1.1rem;
+      overflow-x: auto;
+      font-family: 'Cascadia Code', 'Fira Code', 'Consolas', monospace;
+      font-size: .82rem;
+      line-height: 1.6;
+      color: #e2e8f0;
+      margin: .75rem 0;
+    }
+
+    code {
+      font-family: 'Cascadia Code', 'Fira Code', 'Consolas', monospace;
+      font-size: .85em;
+      background: var(--code-bg);
+      border: 1px solid var(--border);
+      border-radius: 4px;
+      padding: .15em .4em;
+      color: var(--accent2);
+    }
+
+    /* Platform tabs */
+    .platform-tabs { display: flex; gap: .5rem; margin-bottom: 1.5rem; flex-wrap: wrap; }
+
+    .tab-btn {
+      padding: .5rem 1.2rem;
+      border-radius: 8px;
+      border: 1px solid var(--border);
+      background: var(--surface);
+      color: var(--muted);
+      font-size: .85rem;
+      font-weight: 600;
+      cursor: pointer;
+      transition: all .2s;
+    }
+    .tab-btn:hover { border-color: var(--accent); color: var(--text); }
+    .tab-btn.active-railway { background: var(--railway); border-color: var(--railway); color: #fff; }
+    .tab-btn.active-render { background: var(--render); border-color: var(--render); color: #fff; }
+
+    .tab-content { display: none; }
+    .tab-content.active { display: block; }
+
+    /* Info / warning boxes */
+    .info, .warn, .tip {
+      border-radius: 8px;
+      padding: .9rem 1.1rem;
+      margin: .75rem 0;
+      font-size: .88rem;
+      border-left: 3px solid;
+    }
+    .info  { background: #1e2a3a; border-color: #3b82f6; color: #93c5fd; }
+    .warn  { background: #2a1f0d; border-color: var(--warn); color: #fbbf24; }
+    .tip   { background: #0f2a1f; border-color: var(--accent2); color: #6ee7b7; }
+
+    .info strong, .warn strong, .tip strong { display: block; margin-bottom: .3rem; }
+
+    /* Env var table */
+    table { width: 100%; border-collapse: collapse; margin: .75rem 0; font-size: .85rem; }
+    th { text-align: left; padding: .6rem .8rem; background: var(--surface2); color: var(--muted); font-weight: 600; border-bottom: 1px solid var(--border); }
+    td { padding: .6rem .8rem; border-bottom: 1px solid var(--border); vertical-align: top; }
+    td:first-child { font-family: monospace; color: var(--accent2); white-space: nowrap; }
+    tr:last-child td { border-bottom: none; }
+
+    /* Section separator */
+    .section { margin-bottom: 3rem; }
+    .section-title {
+      font-size: .75rem;
+      font-weight: 700;
+      letter-spacing: .1em;
+      text-transform: uppercase;
+      color: var(--accent);
+      margin-bottom: 1.25rem;
+      padding-bottom: .5rem;
+      border-bottom: 1px solid var(--border);
+    }
+
+    /* File tree */
+    .tree {
+      background: var(--code-bg);
+      border: 1px solid var(--border);
+      border-radius: 8px;
+      padding: 1rem 1.25rem;
+      font-family: monospace;
+      font-size: .85rem;
+      color: var(--text);
+      line-height: 2;
+    }
+    .tree .dir { color: var(--accent); }
+    .tree .file { color: var(--accent2); }
+    .tree .note { color: var(--muted); font-style: italic; }
+
+    /* Checklist */
+    .checklist { list-style: none; display: flex; flex-direction: column; gap: .5rem; }
+    .checklist li { display: flex; align-items: flex-start; gap: .6rem; font-size: .9rem; color: var(--muted); }
+    .checklist li::before {
+      content: '☐';
+      flex-shrink: 0;
+      font-size: 1rem;
+      color: var(--accent);
+      margin-top: .05rem;
+    }
+
+    .highlight { color: #fff; }
+  </style>
+</head>
+<body>
+<div class="container">
+
+  <header>
+    <div class="badge">BIA · AI Trading Copilot</div>
+    <h1>Guía de Despliegue</h1>
+    <p class="subtitle">FastAPI + Slack + Supabase + Claude · Railway o Render (gratis)</p>
+  </header>
+
+  <!-- Estructura de archivos -->
+  <div class="section">
+    <div class="section-title">Estructura del proyecto</div>
+    <div class="tree">
+      <span class="dir">bia_trading_copilot/</span><br>
+      &nbsp;&nbsp;├── <span class="file">main.py</span> &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;<span class="note"># Servidor FastAPI</span><br>
+      &nbsp;&nbsp;├── <span class="file">ingest.py</span> &nbsp;&nbsp;&nbsp;&nbsp;<span class="note"># Script de ingesta batch</span><br>
+      &nbsp;&nbsp;├── <span class="file">requirements.txt</span><br>
+      &nbsp;&nbsp;├── <span class="file">Procfile</span> &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;<span class="note"># Para Railway</span><br>
+      &nbsp;&nbsp;├── <span class="file">render.yaml</span> &nbsp;&nbsp;<span class="note"># Para Render</span><br>
+      &nbsp;&nbsp;├── <span class="file">.env</span> &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;<span class="note"># Local (NO subir a git)</span><br>
+      &nbsp;&nbsp;├── <span class="file">.env.example</span> &nbsp;<span class="note"># Plantilla segura para el repo</span><br>
+      &nbsp;&nbsp;└── <span class="file">.gitignore</span>
+    </div>
+  </div>
+
+  <!-- Variables de entorno -->
+  <div class="section">
+    <div class="section-title">Variables de entorno</div>
+    <table>
+      <tr><th>Variable</th><th>Descripción</th></tr>
+      <tr><td>SUPABASE_URL</td><td>URL del proyecto Supabase</td></tr>
+      <tr><td>SUPABASE_KEY</td><td>service_role key de Supabase</td></tr>
+      <tr><td>ANTHROPIC_API_KEY</td><td>API key de Anthropic / Claude</td></tr>
+      <tr><td>SLACK_BOT_TOKEN</td><td>Bot token <code>xoxb-…</code></td></tr>
+      <tr><td>SLACK_CHANNEL_ID</td><td>Canal por defecto para respuestas</td></tr>
+    </table>
+    <div class="warn"><strong>⚠ Importante</strong>El archivo <code>.env</code> ya está en <code>.gitignore</code>. Nunca lo subas al repositorio. Usa <code>.env.example</code> como plantilla pública.</div>
+  </div>
+
+  <!-- Plataformas -->
+  <div class="section">
+    <div class="section-title">Elige la plataforma de despliegue</div>
+
+    <div class="platform-tabs">
+      <button class="tab-btn active-railway" onclick="switchTab('railway', this)">Railway (recomendado)</button>
+      <button class="tab-btn" onclick="switchTab('render', this)">Render</button>
+    </div>
+
+    <!-- RAILWAY -->
+    <div id="tab-railway" class="tab-content active">
+      <div class="tip"><strong>✓ Por qué Railway</strong>Free tier de 500 horas/mes, sin spin-down automático, deploys en segundos desde GitHub, soporte nativo para <code>Procfile</code>.</div>
+
+      <div class="steps">
+        <div class="step">
+          <div class="step-num">1</div>
+          <div class="step-body">
+            <h3>Crea el repositorio en GitHub</h3>
+            <p>Railway deploya desde GitHub. Si aún no tienes el repo:</p>
+            <pre>cd bia_trading_copilot
+git init
+git add .
+git commit -m "initial: BIA Trading Copilot"
+# Crea el repo en github.com y luego:
+git remote add origin https://github.com/TU_ORG/bia-trading-copilot.git
+git push -u origin main</pre>
+          </div>
+        </div>
+
+        <div class="step">
+          <div class="step-num">2</div>
+          <div class="step-body">
+            <h3>Crea el proyecto en Railway</h3>
+            <ol style="padding-left:1.2rem; color: var(--muted); font-size:.9rem; line-height:2;">
+              <li>Ve a <strong style="color:#fff">railway.app</strong> → <em>New Project</em></li>
+              <li>Elige <em>Deploy from GitHub repo</em></li>
+              <li>Selecciona <code>bia-trading-copilot</code></li>
+              <li>Railway detecta el <code>Procfile</code> automáticamente</li>
+            </ol>
+          </div>
+        </div>
+
+        <div class="step">
+          <div class="step-num">3</div>
+          <div class="step-body">
+            <h3>Agrega las variables de entorno</h3>
+            <p>En el panel de Railway: <em>Variables</em> → <em>Raw Editor</em> → pega esto y rellena los valores:</p>
+            <pre>SUPABASE_URL=https://zzxyqziekjylvgumvpft.supabase.co
+SUPABASE_KEY=&lt;tu_service_role_key&gt;
+ANTHROPIC_API_KEY=&lt;tu_anthropic_key&gt;
+SLACK_BOT_TOKEN=&lt;xoxb-tu-token&gt;
+SLACK_CHANNEL_ID=C0B5K5KPEGP</pre>
+            <div class="info"><strong>ℹ PORT</strong>Railway inyecta <code>$PORT</code> automáticamente. El <code>Procfile</code> ya lo usa — no agregues esta variable.</div>
+          </div>
+        </div>
+
+        <div class="step">
+          <div class="step-num">4</div>
+          <div class="step-body">
+            <h3>Obtén la URL pública</h3>
+            <p>En Railway: <em>Settings</em> → <em>Networking</em> → <em>Generate Domain</em>. La URL será algo como:</p>
+            <pre>https://bia-trading-copilot.up.railway.app</pre>
+            <p>Verifica que el servidor responde:</p>
+            <pre>curl https://bia-trading-copilot.up.railway.app/health
+# → {"status": "ok"}</pre>
+          </div>
+        </div>
+
+        <div class="step">
+          <div class="step-num">5</div>
+          <div class="step-body">
+            <h3>Conecta con Slack</h3>
+            <p>En <strong>api.slack.com/apps</strong> → tu app → <em>Event Subscriptions</em>:</p>
+            <ol style="padding-left:1.2rem; color: var(--muted); font-size:.9rem; line-height:2;">
+              <li>Activa <em>Enable Events</em></li>
+              <li>Request URL: <code>https://bia-trading-copilot.up.railway.app/slack/events</code></li>
+              <li>Slack enviará el challenge → el servidor responde → ✓ Verified</li>
+              <li>En <em>Subscribe to bot events</em> agrega: <code>app_mention</code></li>
+              <li>Guarda y reinstala la app en tu workspace</li>
+            </ol>
+          </div>
+        </div>
+      </div>
+    </div>
+
+    <!-- RENDER -->
+    <div id="tab-render" class="tab-content">
+      <div class="warn"><strong>⚠ Spin-down en free tier</strong>Render apaga el servicio tras 15 min de inactividad. El primer request tarda ~30s en reiniciarlo. Usa Railway si necesitas respuesta inmediata.</div>
+
+      <div class="steps">
+        <div class="step">
+          <div class="step-num">1</div>
+          <div class="step-body">
+            <h3>Crea el repositorio en GitHub</h3>
+            <pre>cd bia_trading_copilot
+git init && git add . && git commit -m "initial"
+git remote add origin https://github.com/TU_ORG/bia-trading-copilot.git
+git push -u origin main</pre>
+          </div>
+        </div>
+
+        <div class="step">
+          <div class="step-num">2</div>
+          <div class="step-body">
+            <h3>Crea el Web Service en Render</h3>
+            <ol style="padding-left:1.2rem; color: var(--muted); font-size:.9rem; line-height:2;">
+              <li>Ve a <strong style="color:#fff">render.com</strong> → <em>New +</em> → <em>Web Service</em></li>
+              <li>Conecta el repo <code>bia-trading-copilot</code></li>
+              <li>Render detecta <code>render.yaml</code> automáticamente</li>
+              <li>Plan: <em>Free</em></li>
+            </ol>
+          </div>
+        </div>
+
+        <div class="step">
+          <div class="step-num">3</div>
+          <div class="step-body">
+            <h3>Agrega las variables de entorno</h3>
+            <p><em>Environment</em> → <em>Add Environment Variable</em> (una por una o via Secret File):</p>
+            <pre>SUPABASE_URL, SUPABASE_KEY, ANTHROPIC_API_KEY,
+SLACK_BOT_TOKEN, SLACK_CHANNEL_ID</pre>
+          </div>
+        </div>
+
+        <div class="step">
+          <div class="step-num">4</div>
+          <div class="step-body">
+            <h3>URL pública y Slack</h3>
+            <p>Render asigna: <code>https://bia-trading-copilot.onrender.com</code></p>
+            <p>Configura el Event Subscriptions en Slack igual que en Railway (paso 5 arriba), usando esta URL.</p>
+          </div>
+        </div>
+      </div>
+    </div>
+  </div>
+
+  <!-- Ingesta -->
+  <div class="section">
+    <div class="section-title">Correr la ingesta</div>
+    <p>El script <code>ingest.py</code> es independiente del servidor. Puedes correrlo localmente o programarlo:</p>
+    <pre># Local (con .env presente)
+python ingest.py
+
+# En Railway como Cron Job (panel → New → Cron Job)
+# Comando: python ingest.py
+# Schedule: 0 * * * *   ← cada hora</pre>
+    <div class="tip"><strong>💡 Cron en Railway</strong>Railway permite agregar un servicio de tipo <em>Cron Job</em> en el mismo proyecto, usando la misma imagen. Es la forma más limpia de automatizar la ingesta sin servidor adicional.</div>
+  </div>
+
+  <!-- Checklist final -->
+  <div class="section">
+    <div class="section-title">Checklist de verificación</div>
+    <ul class="checklist">
+      <li><span class="highlight">Servidor responde</span> — <code>GET /health</code> retorna <code>{"status":"ok"}</code></li>
+      <li><span class="highlight">Challenge de Slack verificado</span> — URL marcada como Verified en api.slack.com</li>
+      <li><span class="highlight">Bot invitado al canal</span> — <code>/invite @NombreDelBot</code> en el canal</li>
+      <li><span class="highlight">Mention funciona</span> — escribe <code>@bot ¿qué simulaciones hay?</code> y responde en &lt;5s</li>
+      <li><span class="highlight">Ingesta ejecutada</span> — <code>simulation_results</code> tiene filas en Supabase</li>
+      <li><span class="highlight">.env NO está en el repo</span> — <code>git ls-files .env</code> no retorna nada</li>
+    </ul>
+  </div>
+
+</div>
+
+<script>
+function switchTab(platform, btn) {
+  document.querySelectorAll('.tab-content').forEach(t => t.classList.remove('active'));
+  document.querySelectorAll('.tab-btn').forEach(b => b.className = 'tab-btn');
+  document.getElementById('tab-' + platform).classList.add('active');
+  btn.classList.add('active-' + platform);
+}
+</script>
+</body>
+</html>
