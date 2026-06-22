@@ -40,8 +40,33 @@ def get_claude() -> anthropic.Anthropic:
     return _claude
 
 
-# In-memory dedup set — cleared on restart, sufficient for most duplicate scenarios
-processed_events: set[str] = set()
+# ── Persistent deduplication ──────────────────────────────────────────────────
+
+def _is_duplicate(event_ts: str) -> bool:
+    """
+    Returns True if this event_ts was already processed.
+    Uses INSERT to atomically claim the event; only a duplicate-key error (23505)
+    means the event was seen before. Any other error lets the event through so
+    an infra failure never silently drops a message.
+    Cleans up records older than 1 hour on every successful insert.
+    """
+    sb = get_supabase()
+    try:
+        sb.table("processed_events").insert({"event_ts": event_ts}).execute()
+        # Cleanup stale records asynchronously — ignore any errors
+        try:
+            cutoff = (datetime.now(timezone.utc) - timedelta(hours=1)).isoformat()
+            sb.table("processed_events").delete().lt("processed_at", cutoff).execute()
+        except Exception:
+            pass
+        return False  # new event — process it
+    except Exception as e:
+        # Postgres unique-violation code is 23505; treat only that as a duplicate
+        err = str(e)
+        if "23505" in err or "duplicate" in err.lower() or "unique" in err.lower():
+            return True  # genuine duplicate — skip silently
+        # Any other error (table missing, network, etc.) — process the event anyway
+        return False
 
 # ── Constants ─────────────────────────────────────────────────────────────────
 
@@ -431,9 +456,8 @@ async def send_slack_message(channel: str, text: str) -> None:
 
 async def handle_mention(event: dict) -> None:
     event_ts = event.get("event_ts") or event.get("ts", "")
-    if event_ts in processed_events:
+    if _is_duplicate(event_ts):
         return
-    processed_events.add(event_ts)
 
     user_text = event.get("text", "")
     channel   = event.get("channel", SLACK_CHANNEL_ID)
