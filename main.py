@@ -1,5 +1,6 @@
 import os
 import re
+import unicodedata
 from fastapi import FastAPI, Request, BackgroundTasks
 from fastapi.responses import JSONResponse
 import httpx
@@ -78,57 +79,118 @@ def _ctx_simulation_runs() -> str:
     return "\n".join(lines)
 
 
+_SCENARIO_MAP = {"BAJO": "LOW", "MEDIO": "MEDIUM", "ALTO": "HIGH"}
+
+# Known market names that may appear in questions
+_MARKETS = (
+    "ANTIOQUIA|BOGOTA|BOYACA|CALDAS|CALI|CARIBE MAR|CARIBE SOL|CARTAGO|CASANARE|"
+    "CUNDINAMARCA|MEDELLIN|NARINO|NARIÑO|SANTANDER|TOLIMA|VALLE|COSTA|LLANOS|SUROCCIDENTE"
+)
+
+
 def _ctx_cu_components(text: str) -> str:
     sb = get_supabase()
 
-    # Extract agent_code (e.g. NEUC, BIA, EXEC, GNCC, OR) and base_period (MM-YYYY)
-    agent_match = re.search(r"\b(NEUC|BIA|EXEC|GNCC|OR)\b", text, re.IGNORECASE)
+    # ── Extract filters from the question ────────────────────────────────────
+    agent_match  = re.search(r"\b(NEUC|BIA|EXEC|GNCC|OR)\b", text, re.IGNORECASE)
     period_match = re.search(r"\b(\d{2}-\d{4})\b", text)
+    scen_match   = re.search(r"\b(LOW|MEDIUM|HIGH|BAJO|MEDIO|ALTO)\b", text, re.IGNORECASE)
+    # Normalize accents before matching markets (e.g. "Bogotá" → "Bogota")
+    text_norm    = unicodedata.normalize("NFD", text)
+    text_norm    = "".join(c for c in text_norm if unicodedata.category(c) != "Mn")
+    mkt_match    = re.search(_MARKETS, text_norm, re.IGNORECASE)
 
-    # If no base_period in question, default to most recent (05-2026)
-    base_period = period_match.group(1) if period_match else "05-2026"
-    agent_code = agent_match.group(1).upper() if agent_match else None
+    base_period      = period_match.group(1) if period_match else "05-2026"
+    agent_code       = agent_match.group(1).upper() if agent_match else None
+    scenario_asked   = _SCENARIO_MAP.get(scen_match.group(1).upper(), scen_match.group(1).upper()) if scen_match else None
+    market_filter    = mkt_match.group(0).upper() if mkt_match else None
 
-    # Fix tension_level=2 + rate_type=USER as representative slice so the 3 scenarios
-    # (LOW, MEDIUM, HIGH) all fit within the row limit without being crowded out
-    # by tension_level/rate_type variants.
-    query = sb.table("simulation_results").select(
-        "agent_code,base_period,market,period,pb_scenario,"
-        "cu,g,c,t,d,p,r,g_base,g_transitorio,aj,alpha"
-    ).eq("base_period", base_period).eq("tension_level", 2).eq("rate_type", "USER").in_(
-        "pb_scenario", ["LOW", "MEDIUM", "HIGH"]
+    # ── Step 1: discover which pb_scenario values exist for this run ─────────
+    avail_q = (
+        sb.table("simulation_results")
+        .select("pb_scenario")
+        .eq("base_period", base_period)
     )
+    if agent_code:
+        avail_q = avail_q.eq("agent_code", agent_code)
 
+    avail_rows       = avail_q.limit(2000).execute().data or []
+    available        = sorted({r["pb_scenario"] for r in avail_rows})
+
+    if not available:
+        hint = f"agent_code={agent_code}, " if agent_code else ""
+        return f"No hay datos en simulation_results para {hint}base_period={base_period}."
+
+    # ── Step 2: resolve which scenarios to fetch ─────────────────────────────
+    scenario_warning: str | None = None
+    if scenario_asked:
+        if scenario_asked in available:
+            scenarios_to_fetch = [scenario_asked]
+        else:
+            scenarios_to_fetch = available
+            scenario_warning = (
+                f"⚠️ No encontré el escenario *{scenario_asked}* para base_period={base_period}. "
+                f"Te muestro los disponibles: *{', '.join(available)}*."
+            )
+    else:
+        scenarios_to_fetch = available  # all three when not specified
+
+    # ── Step 3: main data query ───────────────────────────────────────────────
+    # Use tension_level=2 + rate_type=USER as the canonical representative slice.
+    # 23 mercados × 3 escenarios × 12 períodos = ~828 filas → limit 1500 cubre holgado.
+    query = (
+        sb.table("simulation_results")
+        .select(
+            "agent_code,base_period,market,period,pb_scenario,"
+            "cu,g,c,t,d,p,r,g_base,g_transitorio,aj,alpha"
+        )
+        .eq("base_period", base_period)
+        .eq("tension_level", 2)
+        .eq("rate_type", "USER")
+        .in_("pb_scenario", scenarios_to_fetch)
+    )
     if agent_code:
         query = query.eq("agent_code", agent_code)
+    if market_filter:
+        query = query.ilike("market", f"%{market_filter}%")
 
-    rows = query.order("base_period", desc=True).order("period").limit(1000).execute().data or []
+    rows = query.order("period").order("pb_scenario").limit(1500).execute().data or []
 
     if not rows:
-        hint = f"agent_code={agent_code}, " if agent_code else ""
-        return f"No se encontraron resultados en simulation_results ({hint}base_period={base_period})."
+        return (
+            f"No se encontraron registros para base_period={base_period}, "
+            f"escenarios={scenarios_to_fetch}"
+            + (f", mercado={market_filter}" if market_filter else "") + "."
+        )
 
-    # Group by market + period + pb_scenario, average across tension_level/rate_type variants
+    # ── Step 4: group and format ──────────────────────────────────────────────
     from collections import defaultdict
     groups: dict = defaultdict(list)
     for r in rows:
-        key = (r["market"], r["period"], r["pb_scenario"])
-        groups[key].append(r)
+        groups[(r["market"], r["period"], r["pb_scenario"])].append(r)
 
     agent_label = rows[0]["agent_code"]
-    lines = [
-        f"=== CU y componentes — {agent_label} | base_period={base_period} ===",
-        f"({len(rows)} registros · {len(groups)} combinaciones mercado/período/escenario · escenarios: LOW, MEDIUM, HIGH)",
+    lines: list[str] = []
+
+    if scenario_warning:
+        lines.append(scenario_warning)
+
+    lines += [
+        f"=== CU y componentes — {agent_label} | base_period={base_period}"
+        + (f" | mercado={market_filter}" if market_filter else "") + " ===",
+        f"Escenarios disponibles: {', '.join(available)} | Mostrando: {', '.join(scenarios_to_fetch)}",
+        f"tension_level=2, rate_type=USER | {len(groups)} combinaciones mercado/período/escenario",
     ]
-    for (market, period, scenario), entries in list(groups.items())[:60]:
-        avg = lambda col: round(sum(e[col] or 0 for e in entries) / len(entries), 2)
+    for (market, period, scenario), entries in list(groups.items())[:90]:
+        def avg(col: str) -> float:
+            return round(sum(e[col] or 0 for e in entries) / len(entries), 2)
         lines.append(
             f"  {market} | {period} | {scenario}: "
             f"CU={avg('cu')} G={avg('g')} C={avg('c')} "
             f"T={avg('t')} D={avg('d')} P={avg('p')} R={avg('r')}"
         )
-    if len(groups) > 60:
-        lines.append(f"  ... y {len(groups) - 60} combinaciones más.")
+    if len(groups) > 90:
+        lines.append(f"  ... y {len(groups) - 90} combinaciones más.")
     return "\n".join(lines)
 
 
