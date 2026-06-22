@@ -85,47 +85,50 @@ def _ctx_cu_components(text: str) -> str:
     agent_match = re.search(r"\b(NEUC|BIA|EXEC|GNCC|OR)\b", text, re.IGNORECASE)
     period_match = re.search(r"\b(\d{2}-\d{4})\b", text)
 
+    # If no base_period in question, default to most recent (05-2026)
+    base_period = period_match.group(1) if period_match else "05-2026"
+    agent_code = agent_match.group(1).upper() if agent_match else None
+
+    # Fix tension_level=2 + rate_type=USER as representative slice so the 3 scenarios
+    # (LOW, MEDIUM, HIGH) all fit within the row limit without being crowded out
+    # by tension_level/rate_type variants.
     query = sb.table("simulation_results").select(
-        "agent_code,base_period,market,period,pb_scenario,tension_level,rate_type,"
+        "agent_code,base_period,market,period,pb_scenario,"
         "cu,g,c,t,d,p,r,g_base,g_transitorio,aj,alpha"
+    ).eq("base_period", base_period).eq("tension_level", 2).eq("rate_type", "USER").in_(
+        "pb_scenario", ["LOW", "MEDIUM", "HIGH"]
     )
 
-    if agent_match:
-        query = query.eq("agent_code", agent_match.group(1).upper())
-    if period_match:
-        query = query.eq("base_period", period_match.group(1))
+    if agent_code:
+        query = query.eq("agent_code", agent_code)
 
-    rows = query.order("period").limit(100).execute().data or []
+    rows = query.order("base_period", desc=True).order("period").limit(1000).execute().data or []
 
     if not rows:
-        filters = []
-        if agent_match:
-            filters.append(f"agent_code={agent_match.group(1).upper()}")
-        if period_match:
-            filters.append(f"base_period={period_match.group(1)}")
-        hint = f" (filtros: {', '.join(filters)})" if filters else ""
-        return f"No se encontraron resultados en simulation_results{hint}."
+        hint = f"agent_code={agent_code}, " if agent_code else ""
+        return f"No se encontraron resultados en simulation_results ({hint}base_period={base_period})."
 
-    # Summarize: group by market+period, show avg CU and components
+    # Group by market + period + pb_scenario, average across tension_level/rate_type variants
     from collections import defaultdict
     groups: dict = defaultdict(list)
     for r in rows:
         key = (r["market"], r["period"], r["pb_scenario"])
         groups[key].append(r)
 
+    agent_label = rows[0]["agent_code"]
     lines = [
-        f"=== CU y componentes — {rows[0]['agent_code']} base {rows[0]['base_period']} ===",
-        f"({len(rows)} registros, {len(groups)} combinaciones mercado/período/escenario)",
+        f"=== CU y componentes — {agent_label} | base_period={base_period} ===",
+        f"({len(rows)} registros · {len(groups)} combinaciones mercado/período/escenario · escenarios: LOW, MEDIUM, HIGH)",
     ]
-    for (market, period, scenario), entries in list(groups.items())[:30]:
+    for (market, period, scenario), entries in list(groups.items())[:60]:
         avg = lambda col: round(sum(e[col] or 0 for e in entries) / len(entries), 2)
         lines.append(
             f"  {market} | {period} | {scenario}: "
             f"CU={avg('cu')} G={avg('g')} C={avg('c')} "
             f"T={avg('t')} D={avg('d')} P={avg('p')} R={avg('r')}"
         )
-    if len(groups) > 30:
-        lines.append(f"  ... y {len(groups) - 30} combinaciones más.")
+    if len(groups) > 60:
+        lines.append(f"  ... y {len(groups) - 60} combinaciones más.")
     return "\n".join(lines)
 
 
