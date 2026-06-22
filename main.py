@@ -4,6 +4,7 @@ import unicodedata
 from collections import defaultdict
 from datetime import datetime, timezone, timedelta
 from fastapi import FastAPI, Request, BackgroundTasks
+from fastapi import Response
 from fastapi.responses import JSONResponse
 import httpx
 from supabase import create_client, Client
@@ -455,10 +456,6 @@ async def send_slack_message(channel: str, text: str) -> None:
 
 
 async def handle_mention(event: dict) -> None:
-    event_ts = event.get("event_ts") or event.get("ts", "")
-    if _is_duplicate(event_ts):
-        return
-
     user_text = event.get("text", "")
     channel   = event.get("channel", SLACK_CHANNEL_ID)
     context   = build_context(user_text)
@@ -494,14 +491,25 @@ async def handle_mention(event: dict) -> None:
 async def slack_events(request: Request, background_tasks: BackgroundTasks):
     body = await request.json()
 
+    # URL verification challenge — must reply synchronously with the challenge value
     if body.get("type") == "url_verification":
         return JSONResponse({"challenge": body["challenge"]})
 
     event = body.get("event", {})
     if event.get("type") == "app_mention":
+        event_ts = event.get("event_ts") or event.get("ts", "")
+
+        # Claim the event atomically HERE, before returning 200.
+        # This is the only reliable dedup point when Render runs multiple instances:
+        # the Supabase PRIMARY KEY constraint is the mutex — only one INSERT wins,
+        # the rest get a 23505 and are dropped before any background work is queued.
+        if event_ts and _is_duplicate(event_ts):
+            return Response(status_code=200)
+
         background_tasks.add_task(handle_mention, event)
 
-    return JSONResponse({"ok": True})
+    # 200 goes out immediately; background task runs after the response is sent
+    return Response(status_code=200)
 
 
 @app.get("/health")
