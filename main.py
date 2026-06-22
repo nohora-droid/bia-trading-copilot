@@ -1,6 +1,8 @@
 import os
 import re
 import unicodedata
+from collections import defaultdict
+from datetime import datetime, timezone, timedelta
 from fastapi import FastAPI, Request, BackgroundTasks
 from fastapi.responses import JSONResponse
 import httpx
@@ -41,7 +43,22 @@ def get_claude() -> anthropic.Anthropic:
 # In-memory dedup set — cleared on restart, sufficient for most duplicate scenarios
 processed_events: set[str] = set()
 
-# ── Intent detection keywords ─────────────────────────────────────────────────
+# ── Constants ─────────────────────────────────────────────────────────────────
+
+_SCENARIO_MAP = {"BAJO": "LOW", "MEDIO": "MEDIUM", "ALTO": "HIGH"}
+
+_MARKETS = (
+    "ANTIOQUIA|BOGOTA|BOYACA|CALDAS|CALI|CARIBE MAR|CARIBE SOL|CARTAGO|CASANARE|"
+    "CUNDINAMARCA|MEDELLIN|NARINO|NARIÑO|SANTANDER|TOLIMA|VALLE|COSTA|LLANOS|SUROCCIDENTE"
+)
+
+_MONTH_NAMES = {
+    "enero": "01", "febrero": "02", "marzo": "03", "abril": "04",
+    "mayo": "05", "junio": "06", "julio": "07", "agosto": "08",
+    "septiembre": "09", "octubre": "10", "noviembre": "11", "diciembre": "12",
+}
+
+# ── Intent detection ──────────────────────────────────────────────────────────
 
 _CU_KEYWORDS = re.compile(
     r"\b(cu|costo unitario|tarifa|componente|g\b|c\b|t\b|d\b|p\b|r\b|g_base|desglose)\b",
@@ -52,56 +69,171 @@ _SPREAD_KEYWORDS = re.compile(
     re.IGNORECASE,
 )
 _RUNS_KEYWORDS = re.compile(
-    r"\b(corrida|simulaci[oó]n|run|reciente|[uú]ltim[ao]|ejecut)\b",
+    r"\b(corrida|simulaci[oó]n|run|reciente|[uú]ltim[ao]|ejecut|qui[eé]n corri[oó]|hoy|ayer)\b",
     re.IGNORECASE,
 )
 
+# ── Run resolution ────────────────────────────────────────────────────────────
+
+def _fmt_run(run: dict) -> str:
+    """One-line trazabilidad string shown in every response."""
+    run_id = run.get("id")
+    created = (run.get("created_at") or "")[:16].replace("T", " ")
+    who = run.get("triggered_by") or "desconocido"
+    official = "si" if run.get("is_official") else "no"
+    agent = run.get("agent_code", "")
+    bp = run.get("base_period", "")
+    return f"Corrida #{run_id} | {agent} | base {bp} | {created} UTC | por {who} | oficial: {official}"
+
+
+_AGENT_CODES = {"neuc", "bia", "exec", "gncc", "or"}
+
+
+def _resolve_run(text: str, agent_code: str) -> dict | None:
+    """
+    Resolve which simulation_run to use based on natural language cues.
+
+    Priority (each falls through to the next if no results):
+      1. "la que corrió <nombre>"  → triggered_by ILIKE '<nombre>%'
+      2. "la de hoy"               → created_at >= today 00:00 UTC
+      3. "la de ayer"              → created_at between yesterday and today
+      4. "la última"               → max created_at regardless of official
+      5. DEFAULT                   → most recent is_official=true
+      6. FINAL FALLBACK            → most recent completed run
+    """
+    sb = get_supabase()
+    now_utc = datetime.now(timezone.utc)
+    today_start = now_utc.replace(hour=0, minute=0, second=0, microsecond=0)
+    yesterday_start = today_start - timedelta(days=1)
+
+    text_lower = text.lower()
+
+    # Person detection: exclude agent codes so "de BIA" doesn't match as a person
+    person_match = re.search(
+        r"(?:corri[oó]|ejecut[oó])\s+([a-záéíóúñ]+)",
+        text_lower,
+    )
+    if person_match and person_match.group(1).lower() in _AGENT_CODES:
+        person_match = None
+
+    wants_today     = bool(re.search(r"\bhoy\b", text_lower))
+    wants_yesterday = bool(re.search(r"\bayer\b", text_lower))
+    wants_latest    = bool(re.search(r"\b[uú]ltim[ao]\b", text_lower)) and not wants_today and not wants_yesterday
+
+    # Build a fresh query each time — avoids QueryBuilder mutation across calls
+    def q(**extra_filters):
+        builder = (
+            sb.table("simulation_runs")
+            .select("id,agent_code,base_period,is_official,triggered_by,created_at,status")
+            .eq("agent_code", agent_code)
+            .eq("status", "COMPLETED")
+        )
+        for k, v in extra_filters.items():
+            builder = builder.eq(k, v)
+        return builder
+
+    # Strategy 1 — person name
+    if person_match:
+        name = person_match.group(1).strip()
+        rows = q().ilike("triggered_by", f"{name}%").order("created_at", desc=True).limit(1).execute().data or []
+        if rows:
+            return rows[0]
+
+    # Strategy 2 — today (falls through if empty)
+    if wants_today:
+        rows = q().gte("created_at", today_start.isoformat()).order("created_at", desc=True).limit(1).execute().data or []
+        if rows:
+            return rows[0]
+
+    # Strategy 3 — yesterday (falls through if empty)
+    if wants_yesterday:
+        rows = (
+            q()
+            .gte("created_at", yesterday_start.isoformat())
+            .lt("created_at", today_start.isoformat())
+            .order("created_at", desc=True)
+            .limit(1)
+            .execute()
+            .data or []
+        )
+        if rows:
+            return rows[0]
+
+    # Strategy 4 — latest regardless of official
+    if wants_latest:
+        rows = q().order("created_at", desc=True).limit(1).execute().data or []
+        if rows:
+            return rows[0]
+
+    # Default — most recent official run
+    rows = q(**{"is_official": True}).order("created_at", desc=True).limit(1).execute().data or []
+    if rows:
+        return rows[0]
+
+    # Final fallback — any completed run
+    rows = q().order("created_at", desc=True).limit(1).execute().data or []
+    return rows[0] if rows else None
+
+
 # ── Context builders ──────────────────────────────────────────────────────────
 
-def _ctx_simulation_runs() -> str:
-    rows = (
-        get_supabase()
-        .table("simulation_runs")
-        .select("id,status,created_at,params")
-        .order("created_at", desc=True)
-        .limit(20)
-        .execute()
-        .data or []
+def _ctx_simulation_runs(text: str) -> str:
+    sb = get_supabase()
+
+    text_lower = text.lower()
+    wants_compare = bool(re.search(r"\bcompar\w*\b", text_lower))
+
+    # Detect person filter
+    person_match = re.search(r"(?:corri[oó]|ejecut[oó]|de)\s+([a-záéíóúñ]+)", text_lower)
+    wants_today     = bool(re.search(r"\bhoy\b", text_lower))
+    wants_yesterday = bool(re.search(r"\bayer\b", text_lower))
+
+    now_utc = datetime.now(timezone.utc)
+    today_start = now_utc.replace(hour=0, minute=0, second=0, microsecond=0)
+    yesterday_start = today_start - timedelta(days=1)
+
+    q = (
+        sb.table("simulation_runs")
+        .select("id,agent_code,base_period,is_official,triggered_by,created_at,status")
+        .eq("status", "COMPLETED")
     )
+
+    if person_match:
+        q = q.ilike("triggered_by", f"{person_match.group(1).strip()}%")
+    elif wants_today:
+        q = q.gte("created_at", today_start.isoformat())
+    elif wants_yesterday:
+        q = q.gte("created_at", yesterday_start.isoformat()).lt("created_at", today_start.isoformat())
+
+    rows = q.order("created_at", desc=True).limit(20).execute().data or []
+
     if not rows:
-        return "No hay corridas recientes en simulation_runs."
-    lines = ["=== Corridas recientes (simulation_runs) ==="]
+        return "No se encontraron corridas con esos criterios."
+
+    lines = ["=== Corridas de simulacion ==="]
     for r in rows:
+        official = "OFICIAL" if r.get("is_official") else "no oficial"
+        created = (r.get("created_at") or "")[:16].replace("T", " ")
         lines.append(
-            f"run_id={r.get('id')} status={r.get('status')} "
-            f"created_at={r.get('created_at')} params={r.get('params')}"
+            f"  #{r['id']} | {r.get('agent_code')} | base {r.get('base_period')} | "
+            f"{created} UTC | {r.get('triggered_by')} | {official}"
         )
+
+    if wants_compare:
+        official_rows   = [r for r in rows if r.get("is_official")]
+        unofficial_rows = [r for r in rows if not r.get("is_official")]
+        if official_rows and unofficial_rows:
+            lines.append("\n--- Para comparacion ---")
+            lines.append(f"  Oficial mas reciente:    {_fmt_run(official_rows[0])}")
+            lines.append(f"  No oficial mas reciente: {_fmt_run(unofficial_rows[0])}")
+
     return "\n".join(lines)
 
 
-_SCENARIO_MAP = {"BAJO": "LOW", "MEDIO": "MEDIUM", "ALTO": "HIGH"}
-
-# Known market names that may appear in questions
-_MARKETS = (
-    "ANTIOQUIA|BOGOTA|BOYACA|CALDAS|CALI|CARIBE MAR|CARIBE SOL|CARTAGO|CASANARE|"
-    "CUNDINAMARCA|MEDELLIN|NARINO|NARIÑO|SANTANDER|TOLIMA|VALLE|COSTA|LLANOS|SUROCCIDENTE"
-)
-
-# Spanish month names → MM number
-_MONTH_NAMES = {
-    "enero": "01", "febrero": "02", "marzo": "03", "abril": "04",
-    "mayo": "05", "junio": "06", "julio": "07", "agosto": "08",
-    "septiembre": "09", "octubre": "10", "noviembre": "11", "diciembre": "12",
-}
-
-
 def _parse_period(text: str) -> str | None:
-    """Extract a projected period (MM-YYYY) from natural language or numeric form."""
-    # Numeric: 05-2026 or 05/2026
     m = re.search(r"\b(\d{2})[-/](\d{4})\b", text)
     if m:
         return f"{m.group(1)}-{m.group(2)}"
-    # Spanish month name + year: "mayo 2026", "mayo de 2026"
     m = re.search(
         r"\b(" + "|".join(_MONTH_NAMES) + r")\b\s+(?:de\s+)?(\d{4})\b",
         text, re.IGNORECASE,
@@ -111,22 +243,7 @@ def _parse_period(text: str) -> str | None:
     return None
 
 
-def _latest_base_period(sb, agent_code: str) -> str:
-    """Return the most recent base_period available for this agent."""
-    rows = (
-        sb.table("simulation_results")
-        .select("base_period")
-        .eq("agent_code", agent_code)
-        .limit(2000)
-        .execute()
-        .data or []
-    )
-    periods = sorted({r["base_period"] for r in rows}, reverse=True)
-    return periods[0] if periods else "05-2026"
-
-
 def _next_n_periods(sb, base_period: str, agent_code: str, n: int = 3) -> list[str]:
-    """Return the first n projected periods available for this base_period."""
     rows = (
         sb.table("simulation_results")
         .select("period")
@@ -142,28 +259,30 @@ def _next_n_periods(sb, base_period: str, agent_code: str, n: int = 3) -> list[s
 def _ctx_cu_components(text: str) -> str:
     sb = get_supabase()
 
-    # ── Extract filters from the question ────────────────────────────────────
     agent_match = re.search(r"\b(NEUC|BIA|EXEC|GNCC|OR)\b", text, re.IGNORECASE)
     scen_match  = re.search(r"\b(LOW|MEDIUM|HIGH|BAJO|MEDIO|ALTO)\b", text, re.IGNORECASE)
 
-    # Normalize accents before matching markets (e.g. "Bogotá" → "Bogota")
     text_norm = unicodedata.normalize("NFD", text)
     text_norm = "".join(c for c in text_norm if unicodedata.category(c) != "Mn")
     mkt_match = re.search(_MARKETS, text_norm, re.IGNORECASE)
 
-    # period = projected month the user is asking about; default → next 3 months
-    period_asked  = _parse_period(text_norm)
-    agent_code    = agent_match.group(1).upper() if agent_match else "BIA"  # default BIA
+    period_asked   = _parse_period(text_norm)
+    agent_code     = agent_match.group(1).upper() if agent_match else "BIA"
     scenario_asked = (
         _SCENARIO_MAP.get(scen_match.group(1).upper(), scen_match.group(1).upper())
         if scen_match else None
     )
-    market_filter = mkt_match.group(0).upper() if mkt_match else None
+    market_filter  = mkt_match.group(0).upper() if mkt_match else None
 
-    # ── Step 1: use the most recent base_period as data source ───────────────
-    base_period = _latest_base_period(sb, agent_code)
+    # ── Resolve which run to use ──────────────────────────────────────────────
+    run = _resolve_run(text, agent_code)
+    if not run:
+        return f"No se encontro ninguna corrida completada para {agent_code}."
 
-    # ── Step 2: discover available pb_scenario for this run ──────────────────
+    base_period = run["base_period"]
+    run_trace   = _fmt_run(run)
+
+    # ── Discover available pb_scenario ───────────────────────────────────────
     avail_rows = (
         sb.table("simulation_results")
         .select("pb_scenario")
@@ -176,9 +295,9 @@ def _ctx_cu_components(text: str) -> str:
     available = sorted({r["pb_scenario"] for r in avail_rows})
 
     if not available:
-        return f"No hay datos en simulation_results para agent_code={agent_code}, base_period={base_period}."
+        return f"No hay datos de resultados para {run_trace}."
 
-    # ── Step 3: resolve scenario ─────────────────────────────────────────────
+    # ── Resolve scenario ──────────────────────────────────────────────────────
     scenario_warning: str | None = None
     if scenario_asked:
         if scenario_asked in available:
@@ -186,13 +305,13 @@ def _ctx_cu_components(text: str) -> str:
         else:
             scenarios_to_fetch = available
             scenario_warning = (
-                f"No encontre el escenario *{scenario_asked}* para {agent_code}. "
-                f"Te muestro los disponibles: *{', '.join(available)}*."
+                f"No encontre el escenario *{scenario_asked}*. "
+                f"Escenarios disponibles: *{', '.join(available)}*."
             )
     else:
         scenarios_to_fetch = available
 
-    # ── Step 4: resolve periods to show ──────────────────────────────────────
+    # ── Resolve periods to show ───────────────────────────────────────────────
     if period_asked:
         periods_to_fetch = [period_asked]
         period_label = f"period={period_asked}"
@@ -200,8 +319,7 @@ def _ctx_cu_components(text: str) -> str:
         periods_to_fetch = _next_n_periods(sb, base_period, agent_code, n=3)
         period_label = f"proximos 3 periodos ({', '.join(periods_to_fetch)})"
 
-    # ── Step 5: main data query ───────────────────────────────────────────────
-    # tension_level=2 + rate_type=USER as canonical representative slice.
+    # ── Main data query (tension_level=2, rate_type=USER as canonical slice) ──
     query = (
         sb.table("simulation_results")
         .select(
@@ -227,8 +345,7 @@ def _ctx_cu_components(text: str) -> str:
             + (f", mercado={market_filter}" if market_filter else "") + "."
         )
 
-    # ── Step 6: group and format ──────────────────────────────────────────────
-    from collections import defaultdict
+    # ── Group and format ──────────────────────────────────────────────────────
     groups: dict = defaultdict(list)
     for r in rows:
         groups[(r["market"], r["period"], r["pb_scenario"])].append(r)
@@ -238,7 +355,8 @@ def _ctx_cu_components(text: str) -> str:
         lines.append(scenario_warning)
 
     lines += [
-        f"=== CU y componentes — {agent_code} | corrida base_period={base_period} | {period_label}"
+        f"[Trazabilidad] {run_trace}",
+        f"=== CU y componentes — {agent_code} | {period_label}"
         + (f" | mercado={market_filter}" if market_filter else "") + " ===",
         f"Escenarios disponibles: {', '.join(available)} | Mostrando: {', '.join(scenarios_to_fetch)}",
         f"(tension_level=2, rate_type=USER | {len(groups)} combinaciones)",
@@ -276,24 +394,22 @@ def _ctx_spread(text: str) -> str:
     for r in rows[:30]:
         lines.append("  " + "  ".join(f"{k}={v}" for k, v in r.items()))
     if len(rows) > 30:
-        lines.append(f"  ... y {len(rows) - 30} filas más.")
+        lines.append(f"  ... y {len(rows) - 30} filas mas.")
     return "\n".join(lines)
 
 
 def build_context(user_text: str) -> str:
     """Route to the right data sources based on the question's intent."""
-    sections: list[str] = []
-
-    want_cu = bool(_CU_KEYWORDS.search(user_text))
+    want_cu     = bool(_CU_KEYWORDS.search(user_text))
     want_spread = bool(_SPREAD_KEYWORDS.search(user_text))
-    want_runs = bool(_RUNS_KEYWORDS.search(user_text))
+    want_runs   = bool(_RUNS_KEYWORDS.search(user_text))
 
-    # Default: show recent runs if no specific intent detected
     if not any([want_cu, want_spread, want_runs]):
         want_runs = True
 
+    sections: list[str] = []
     if want_runs:
-        sections.append(_ctx_simulation_runs())
+        sections.append(_ctx_simulation_runs(user_text))
     if want_cu:
         sections.append(_ctx_cu_components(user_text))
     if want_spread:
@@ -320,19 +436,20 @@ async def handle_mention(event: dict) -> None:
     processed_events.add(event_ts)
 
     user_text = event.get("text", "")
-    channel = event.get("channel", SLACK_CHANNEL_ID)
-
-    context = build_context(user_text)
+    channel   = event.get("channel", SLACK_CHANNEL_ID)
+    context   = build_context(user_text)
 
     message = get_claude().messages.create(
         model="claude-sonnet-4-6",
         max_tokens=1024,
         system=(
-            "Eres el BIA AI Trading Copilot, un asistente especializado en trading de energía eléctrica en Colombia. "
-            "Tienes acceso a datos reales de simulaciones de tarifas (CU y sus componentes G, C, T, D, P, R), "
-            "corridas de simulación recientes y spread competitivo vs otros agentes del mercado. "
-            "Cuando respondas sobre CU o componentes, menciona el mercado, período y escenario de precio de bolsa. "
-            "Sé conciso y preciso. Usa formato Slack (*negrita*, _cursiva_, listas con -). "
+            "Eres el BIA AI Trading Copilot, asistente especializado en trading de energia electrica en Colombia. "
+            "Tienes acceso a datos reales de simulaciones (CU y componentes G, C, T, D, P, R), "
+            "corridas de simulacion y spread competitivo. "
+            "IMPORTANTE: En TODA respuesta sobre tarifas o resultados, incluye siempre la linea de trazabilidad "
+            "de la corrida usada (Corrida #ID | agente | base | fecha | por quien | oficial: si/no). "
+            "Cuando respondas sobre CU, menciona mercado, periodo proyectado y escenario de precio de bolsa. "
+            "Se conciso y preciso. Usa formato Slack (*negrita*, listas con -). "
             "Responde en el mismo idioma que el usuario."
         ),
         messages=[
