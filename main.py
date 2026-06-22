@@ -1,15 +1,22 @@
+import logging
 import os
 import re
 import unicodedata
 from collections import defaultdict
 from datetime import datetime, timezone, timedelta
-from fastapi import FastAPI, Request, BackgroundTasks
-from fastapi import Response
+from fastapi import FastAPI, Request, BackgroundTasks, Response
 from fastapi.responses import JSONResponse
 import httpx
 from supabase import create_client, Client
 import anthropic
 from dotenv import load_dotenv
+
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s %(levelname)s %(message)s",
+    datefmt="%Y-%m-%dT%H:%M:%S",
+)
+log = logging.getLogger("copilot")
 
 load_dotenv()
 
@@ -464,14 +471,53 @@ async def handle_mention(event: dict) -> None:
         model="claude-sonnet-4-6",
         max_tokens=1024,
         system=(
-            "Eres el BIA AI Trading Copilot, asistente especializado en trading de energia electrica en Colombia. "
-            "Tienes acceso a datos reales de simulaciones (CU y componentes G, C, T, D, P, R), "
-            "corridas de simulacion y spread competitivo. "
-            "IMPORTANTE: En TODA respuesta sobre tarifas o resultados, incluye siempre la linea de trazabilidad "
-            "de la corrida usada (Corrida #ID | agente | base | fecha | por quien | oficial: si/no). "
-            "Cuando respondas sobre CU, menciona mercado, periodo proyectado y escenario de precio de bolsa. "
-            "Se conciso y preciso. Usa formato Slack (*negrita*, listas con -). "
-            "Responde en el mismo idioma que el usuario."
+            "Eres el BIA AI Trading Copilot, asistente especializado en trading de energia electrica en Colombia.\n"
+            "\n"
+            "CODIGOS DE AGENTES Y NOMBRES:\n"
+            "Comercializadores competidores:\n"
+            "- BIA = BIA ENERGY (nosotros)\n"
+            "- EXEC = ENEL X COLOMBIA\n"
+            "- ENBC = ENERBIT\n"
+            "- NEUC = NEU ENERGY\n"
+            "- GNCC = VATIA\n"
+            "- OR = modo batch que agrupa TODOS los Operadores de Red juntos\n"
+            "\n"
+            "OPERADORES DE RED (OR) — importantes para analisis de tandem:\n"
+            "- EPM = Antioquia\n"
+            "- ENEL = Bogota y Cundinamarca\n"
+            "- EMCALI = Cali y Yumbo\n"
+            "- AFINIA = Caribe Mar\n"
+            "- AIRE = Caribe Sol (Air-e)\n"
+            "- CELSIA TOLIMA = Tolima\n"
+            "- CELSIA VALLE = Valle\n"
+            "- EBSA = Boyaca\n"
+            "- CHEC = Caldas\n"
+            "- EEP = Cartago, Pereira, Risaralda\n"
+            "- ESSA = Santander\n"
+            "- CENS = Norte de Santander\n"
+            "- ELECTROHUILA = Huila\n"
+            "- EMSA = Meta\n"
+            "- CEDENAR = Narino\n"
+            "- EDEQ = Quindio\n"
+            "- CETSA = Tulua\n"
+            "- ENERCA = Casanare\n"
+            "- CEO = Cauca\n"
+            "\n"
+            "REGLA DE TANDEM (LA MAS IMPORTANTE):\n"
+            "BIA debe mantener cobertura dentro del promedio de 5 OR de referencia: "
+            "ENEL, EMCALI, AIRE, AFINIA, CELSIA +/- 5%. "
+            "Cuando el usuario pregunte por OR, mostrar los operadores individualmente, no como un solo agente.\n"
+            "\n"
+            "NOMBRES ALTERNATIVOS:\n"
+            "VATIA=GNCC | ENEL X=EXEC | ENERBIT=ENBC | NEU=NEUC | Celsia=CELSIA TOLIMA o CELSIA VALLE segun contexto "
+            "| Air-e=AIRE | Afinia=AFINIA\n"
+            "\n"
+            "INSTRUCCIONES:\n"
+            "- En TODA respuesta sobre tarifas incluye la trazabilidad de la corrida usada: "
+            "Corrida #ID | agente | base | fecha | por quien | oficial: si/no\n"
+            "- Cuando respondas sobre CU menciona mercado, periodo proyectado y escenario de precio de bolsa\n"
+            "- Se conciso y preciso. Usa formato Slack (*negrita*, listas con -)\n"
+            "- Responde en el mismo idioma que el usuario"
         ),
         messages=[
             {
@@ -489,26 +535,31 @@ async def handle_mention(event: dict) -> None:
 
 @app.post("/slack/events")
 async def slack_events(request: Request, background_tasks: BackgroundTasks):
+    t0 = datetime.now(timezone.utc)
     body = await request.json()
 
-    # URL verification challenge — must reply synchronously with the challenge value
+    # URL verification challenge
     if body.get("type") == "url_verification":
+        log.info("SLACK challenge received — responding immediately")
         return JSONResponse({"challenge": body["challenge"]})
 
-    event = body.get("event", {})
-    if event.get("type") == "app_mention":
-        event_ts = event.get("event_ts") or event.get("ts", "")
+    event    = body.get("event", {})
+    event_ts = event.get("event_ts") or event.get("ts", "")
 
-        # Claim the event atomically HERE, before returning 200.
-        # This is the only reliable dedup point when Render runs multiple instances:
-        # the Supabase PRIMARY KEY constraint is the mutex — only one INSERT wins,
-        # the rest get a 23505 and are dropped before any background work is queued.
+    log.info("SLACK event received | type=%s event_ts=%s t=%s",
+             event.get("type"), event_ts, t0.isoformat())
+
+    if event.get("type") == "app_mention":
+        # Claim atomically via Supabase PK — distributed mutex across all instances
         if event_ts and _is_duplicate(event_ts):
+            elapsed = (datetime.now(timezone.utc) - t0).total_seconds()
+            log.info("SLACK duplicate dropped | event_ts=%s elapsed=%.3fs", event_ts, elapsed)
             return Response(status_code=200)
 
         background_tasks.add_task(handle_mention, event)
 
-    # 200 goes out immediately; background task runs after the response is sent
+    elapsed = (datetime.now(timezone.utc) - t0).total_seconds()
+    log.info("SLACK 200 sent | event_ts=%s elapsed=%.3fs", event_ts, elapsed)
     return Response(status_code=200)
 
 
