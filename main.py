@@ -87,41 +87,98 @@ _MARKETS = (
     "CUNDINAMARCA|MEDELLIN|NARINO|NARIÑO|SANTANDER|TOLIMA|VALLE|COSTA|LLANOS|SUROCCIDENTE"
 )
 
+# Spanish month names → MM number
+_MONTH_NAMES = {
+    "enero": "01", "febrero": "02", "marzo": "03", "abril": "04",
+    "mayo": "05", "junio": "06", "julio": "07", "agosto": "08",
+    "septiembre": "09", "octubre": "10", "noviembre": "11", "diciembre": "12",
+}
+
+
+def _parse_period(text: str) -> str | None:
+    """Extract a projected period (MM-YYYY) from natural language or numeric form."""
+    # Numeric: 05-2026 or 05/2026
+    m = re.search(r"\b(\d{2})[-/](\d{4})\b", text)
+    if m:
+        return f"{m.group(1)}-{m.group(2)}"
+    # Spanish month name + year: "mayo 2026", "mayo de 2026"
+    m = re.search(
+        r"\b(" + "|".join(_MONTH_NAMES) + r")\b\s+(?:de\s+)?(\d{4})\b",
+        text, re.IGNORECASE,
+    )
+    if m:
+        return f"{_MONTH_NAMES[m.group(1).lower()]}-{m.group(2)}"
+    return None
+
+
+def _latest_base_period(sb, agent_code: str) -> str:
+    """Return the most recent base_period available for this agent."""
+    rows = (
+        sb.table("simulation_results")
+        .select("base_period")
+        .eq("agent_code", agent_code)
+        .limit(2000)
+        .execute()
+        .data or []
+    )
+    periods = sorted({r["base_period"] for r in rows}, reverse=True)
+    return periods[0] if periods else "05-2026"
+
+
+def _next_n_periods(sb, base_period: str, agent_code: str, n: int = 3) -> list[str]:
+    """Return the first n projected periods available for this base_period."""
+    rows = (
+        sb.table("simulation_results")
+        .select("period")
+        .eq("base_period", base_period)
+        .eq("agent_code", agent_code)
+        .limit(2000)
+        .execute()
+        .data or []
+    )
+    return sorted({r["period"] for r in rows})[:n]
+
 
 def _ctx_cu_components(text: str) -> str:
     sb = get_supabase()
 
     # ── Extract filters from the question ────────────────────────────────────
-    agent_match  = re.search(r"\b(NEUC|BIA|EXEC|GNCC|OR)\b", text, re.IGNORECASE)
-    period_match = re.search(r"\b(\d{2}-\d{4})\b", text)
-    scen_match   = re.search(r"\b(LOW|MEDIUM|HIGH|BAJO|MEDIO|ALTO)\b", text, re.IGNORECASE)
+    agent_match = re.search(r"\b(NEUC|BIA|EXEC|GNCC|OR)\b", text, re.IGNORECASE)
+    scen_match  = re.search(r"\b(LOW|MEDIUM|HIGH|BAJO|MEDIO|ALTO)\b", text, re.IGNORECASE)
+
     # Normalize accents before matching markets (e.g. "Bogotá" → "Bogota")
-    text_norm    = unicodedata.normalize("NFD", text)
-    text_norm    = "".join(c for c in text_norm if unicodedata.category(c) != "Mn")
-    mkt_match    = re.search(_MARKETS, text_norm, re.IGNORECASE)
+    text_norm = unicodedata.normalize("NFD", text)
+    text_norm = "".join(c for c in text_norm if unicodedata.category(c) != "Mn")
+    mkt_match = re.search(_MARKETS, text_norm, re.IGNORECASE)
 
-    base_period      = period_match.group(1) if period_match else "05-2026"
-    agent_code       = agent_match.group(1).upper() if agent_match else None
-    scenario_asked   = _SCENARIO_MAP.get(scen_match.group(1).upper(), scen_match.group(1).upper()) if scen_match else None
-    market_filter    = mkt_match.group(0).upper() if mkt_match else None
+    # period = projected month the user is asking about; default → next 3 months
+    period_asked  = _parse_period(text_norm)
+    agent_code    = agent_match.group(1).upper() if agent_match else "BIA"  # default BIA
+    scenario_asked = (
+        _SCENARIO_MAP.get(scen_match.group(1).upper(), scen_match.group(1).upper())
+        if scen_match else None
+    )
+    market_filter = mkt_match.group(0).upper() if mkt_match else None
 
-    # ── Step 1: discover which pb_scenario values exist for this run ─────────
-    avail_q = (
+    # ── Step 1: use the most recent base_period as data source ───────────────
+    base_period = _latest_base_period(sb, agent_code)
+
+    # ── Step 2: discover available pb_scenario for this run ──────────────────
+    avail_rows = (
         sb.table("simulation_results")
         .select("pb_scenario")
         .eq("base_period", base_period)
+        .eq("agent_code", agent_code)
+        .limit(2000)
+        .execute()
+        .data or []
     )
-    if agent_code:
-        avail_q = avail_q.eq("agent_code", agent_code)
-
-    avail_rows       = avail_q.limit(2000).execute().data or []
-    available        = sorted({r["pb_scenario"] for r in avail_rows})
+    available = sorted({r["pb_scenario"] for r in avail_rows})
 
     if not available:
-        hint = f"agent_code={agent_code}, " if agent_code else ""
-        return f"No hay datos en simulation_results para {hint}base_period={base_period}."
+        return f"No hay datos en simulation_results para agent_code={agent_code}, base_period={base_period}."
 
-    # ── Step 2: resolve which scenarios to fetch ─────────────────────────────
+    # ── Step 3: resolve scenario ─────────────────────────────────────────────
     scenario_warning: str | None = None
     if scenario_asked:
         if scenario_asked in available:
@@ -129,15 +186,22 @@ def _ctx_cu_components(text: str) -> str:
         else:
             scenarios_to_fetch = available
             scenario_warning = (
-                f"⚠️ No encontré el escenario *{scenario_asked}* para base_period={base_period}. "
+                f"No encontre el escenario *{scenario_asked}* para {agent_code}. "
                 f"Te muestro los disponibles: *{', '.join(available)}*."
             )
     else:
-        scenarios_to_fetch = available  # all three when not specified
+        scenarios_to_fetch = available
 
-    # ── Step 3: main data query ───────────────────────────────────────────────
-    # Use tension_level=2 + rate_type=USER as the canonical representative slice.
-    # 23 mercados × 3 escenarios × 12 períodos = ~828 filas → limit 1500 cubre holgado.
+    # ── Step 4: resolve periods to show ──────────────────────────────────────
+    if period_asked:
+        periods_to_fetch = [period_asked]
+        period_label = f"period={period_asked}"
+    else:
+        periods_to_fetch = _next_n_periods(sb, base_period, agent_code, n=3)
+        period_label = f"proximos 3 periodos ({', '.join(periods_to_fetch)})"
+
+    # ── Step 5: main data query ───────────────────────────────────────────────
+    # tension_level=2 + rate_type=USER as canonical representative slice.
     query = (
         sb.table("simulation_results")
         .select(
@@ -145,41 +209,39 @@ def _ctx_cu_components(text: str) -> str:
             "cu,g,c,t,d,p,r,g_base,g_transitorio,aj,alpha"
         )
         .eq("base_period", base_period)
+        .eq("agent_code", agent_code)
         .eq("tension_level", 2)
         .eq("rate_type", "USER")
         .in_("pb_scenario", scenarios_to_fetch)
+        .in_("period", periods_to_fetch)
     )
-    if agent_code:
-        query = query.eq("agent_code", agent_code)
     if market_filter:
         query = query.ilike("market", f"%{market_filter}%")
 
-    rows = query.order("period").order("pb_scenario").limit(1500).execute().data or []
+    rows = query.order("period").order("market").order("pb_scenario").limit(1500).execute().data or []
 
     if not rows:
         return (
-            f"No se encontraron registros para base_period={base_period}, "
+            f"No se encontraron registros para {agent_code}, {period_label}, "
             f"escenarios={scenarios_to_fetch}"
             + (f", mercado={market_filter}" if market_filter else "") + "."
         )
 
-    # ── Step 4: group and format ──────────────────────────────────────────────
+    # ── Step 6: group and format ──────────────────────────────────────────────
     from collections import defaultdict
     groups: dict = defaultdict(list)
     for r in rows:
         groups[(r["market"], r["period"], r["pb_scenario"])].append(r)
 
-    agent_label = rows[0]["agent_code"]
     lines: list[str] = []
-
     if scenario_warning:
         lines.append(scenario_warning)
 
     lines += [
-        f"=== CU y componentes — {agent_label} | base_period={base_period}"
+        f"=== CU y componentes — {agent_code} | corrida base_period={base_period} | {period_label}"
         + (f" | mercado={market_filter}" if market_filter else "") + " ===",
         f"Escenarios disponibles: {', '.join(available)} | Mostrando: {', '.join(scenarios_to_fetch)}",
-        f"tension_level=2, rate_type=USER | {len(groups)} combinaciones mercado/período/escenario",
+        f"(tension_level=2, rate_type=USER | {len(groups)} combinaciones)",
     ]
     for (market, period, scenario), entries in list(groups.items())[:90]:
         def avg(col: str) -> float:
@@ -190,7 +252,7 @@ def _ctx_cu_components(text: str) -> str:
             f"T={avg('t')} D={avg('d')} P={avg('p')} R={avg('r')}"
         )
     if len(groups) > 90:
-        lines.append(f"  ... y {len(groups) - 90} combinaciones más.")
+        lines.append(f"  ... y {len(groups) - 90} combinaciones mas.")
     return "\n".join(lines)
 
 
