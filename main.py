@@ -867,6 +867,43 @@ async def health():
     return {"status": "ok"}
 
 
+@app.get("/debug/dedup")
+async def debug_dedup(event_ts: str = ""):
+    sb = get_supabase()
+    try:
+        count_res = sb.table("processed_events").select("event_ts", count="exact").execute()
+        total = count_res.count
+
+        recent = (
+            sb.table("processed_events")
+            .select("event_ts,processed_at")
+            .order("processed_at", desc=True)
+            .limit(5)
+            .execute()
+            .data or []
+        )
+
+        test_result = None
+        if event_ts:
+            exists = (
+                sb.table("processed_events")
+                .select("event_ts,processed_at")
+                .eq("event_ts", event_ts)
+                .execute()
+                .data or []
+            )
+            test_result = exists[0] if exists else "not found"
+
+        return {
+            "total_rows": total,
+            "recent_5": recent,
+            "query_event_ts": event_ts or None,
+            "query_result": test_result,
+        }
+    except Exception as e:
+        return JSONResponse(status_code=500, content={"error": str(e)})
+
+
 @app.get("/debug/tandem")
 async def debug_tandem():
     """
