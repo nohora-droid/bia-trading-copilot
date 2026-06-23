@@ -654,19 +654,17 @@ def _ctx_tandem(text: str) -> str:
     if not bia_rows:
         return "=== Tándem ===\nSin datos de qc para BIA en la corrida oficial."
 
-    # Build BIA qc dict: {period: qc}
+    # Build BIA qc dict: {period: qc_pct} — qc is a ratio (0-1), convert to percentage
     bia_qc: dict[str, float] = {}
     for r in bia_rows:
         if r.get("qc") is not None:
-            bia_qc[r["period"]] = float(r["qc"])
+            bia_qc[r["period"]] = float(r["qc"]) * 100.0
 
-    # 3. Fetch qc for OR reference group
-    # OR runs use agent_code='OR'; filter by or_code for the specific operators
+    # 3. Fetch qc for OR reference group — filter by or_code directly (no agent_code filter)
     try:
         or_rows = (
             sb.table("simulation_results")
             .select("or_code,period,qc")
-            .eq("agent_code", "OR")
             .in_("or_code", _TANDEM_OR_REFS)
             .eq("tension_level", 2)
             .eq("rate_type", "USER")
@@ -679,11 +677,11 @@ def _ctx_tandem(text: str) -> str:
     except Exception as e:
         return f"=== Tándem ===\nError consultando qc de OR de referencia: {e}"
 
-    # 4. Calculate per-period average qc of the OR reference group
+    # 4. Calculate per-period average qc of the OR reference group (converted to %)
     or_by_period: dict[str, list[float]] = defaultdict(list)
     for r in or_rows:
         if r.get("qc") is not None and r.get("period") and r.get("or_code") in _TANDEM_OR_REFS:
-            or_by_period[r["period"]].append(float(r["qc"]))
+            or_by_period[r["period"]].append(float(r["qc"]) * 100.0)
 
     # 5. Build output — one row per period
     lines = [
@@ -693,7 +691,7 @@ def _ctx_tandem(text: str) -> str:
         f"por={bia_run.get('triggered_by','')} | "
         f"oficial={'sí' if bia_run.get('is_official') else 'no'}",
         f"OR de referencia: {', '.join(_TANDEM_OR_REFS)}",
-        f"(escenario: MEDIUM | tension_level=2 | rate_type=USER)",
+        f"(escenario: MEDIUM | tension_level=2 | rate_type=USER | qc expresado en %)",
         "",
         f"{'Periodo':<10} {'qc_BIA':>8} {'qc_OR_avg':>10} {'banda_low':>10} {'banda_high':>11} {'estado':>12}",
         "-" * 65,
@@ -701,7 +699,7 @@ def _ctx_tandem(text: str) -> str:
 
     all_periods = sorted(set(bia_qc.keys()) | set(or_by_period.keys()))
     for period in all_periods:
-        qc_bia = bia_qc.get(period)
+        qc_bia  = bia_qc.get(period)
         or_vals = or_by_period.get(period, [])
         if not or_vals:
             qc_or_avg = band_low = band_high = None
@@ -719,10 +717,10 @@ def _ctx_tandem(text: str) -> str:
             else:
                 estado = "✅ en banda"
 
-        bia_str  = f"{qc_bia:.1f}%" if qc_bia is not None else "  N/A"
+        bia_str  = f"{qc_bia:.1f}%"  if qc_bia    is not None else "  N/A"
         avg_str  = f"{qc_or_avg:.1f}%" if qc_or_avg is not None else "  N/A"
-        low_str  = f"{band_low:.1f}%" if band_low is not None else "  N/A"
-        high_str = f"{band_high:.1f}%" if band_high is not None else "  N/A"
+        low_str  = f"{band_low:.1f}%"  if band_low  is not None else "  N/A"
+        high_str = f"{band_high:.1f}%" if band_high  is not None else "  N/A"
         lines.append(f"{period:<10} {bia_str:>8} {avg_str:>10} {low_str:>10} {high_str:>11} {estado:>12}")
 
     # Summary counts for the LLM
