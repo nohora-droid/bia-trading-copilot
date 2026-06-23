@@ -641,26 +641,46 @@ def _ctx_tandem(text: str) -> str:
 
     or_run_id = or_run["id"]
 
-    # 3. Fetch qc for BIA — qc is uniform across all variants per period.
-    # limit(300) = 12 periodos × ~25 variantes; dedup in Python takes first per period.
+    # 3. Fetch qc for BIA via SQL function (SELECT DISTINCT period, qc).
+    # Falls back to paginated scan if the function doesn't exist yet.
+    bia_rows = []
     try:
-        bia_rows = (
-            sb.table("simulation_results")
-            .select("period,qc")
-            .eq("run_id", bia_run_id)
-            .not_.is_("qc", "null")
-            .order("period")
-            .limit(300)
-            .execute()
-            .data or []
-        )
-    except Exception as e:
-        return f"=== Tándem ===\nError consultando qc de BIA: {e}"
+        rpc_rows = sb.rpc("get_bia_qc_by_period", {"p_run_id": bia_run_id}).execute().data or []
+        if rpc_rows:
+            bia_rows = rpc_rows
+            log.info("TANDEM BIA rpc | run_id=%s periodos=%d", bia_run_id, len(bia_rows))
+    except Exception as rpc_err:
+        log.warning("TANDEM BIA rpc unavailable (%s) — falling back to paginated scan", rpc_err)
 
-    log.info("TANDEM BIA query | run_id=%s filas_raw=%d", bia_run_id, len(bia_rows))
-    if bia_rows:
-        sample = [(r.get("period"), r.get("qc")) for r in bia_rows[:5]]
-        log.info("TANDEM BIA sample (primeras 5): %s", sample)
+    if not bia_rows:
+        # Fallback: paginate in blocks of 500 until we have all 12 distinct periods
+        PAGE = 500
+        offset = 0
+        seen_periods: set[str] = set()
+        while True:
+            try:
+                chunk = (
+                    sb.table("simulation_results")
+                    .select("period,qc")
+                    .eq("run_id", bia_run_id)
+                    .not_.is_("qc", "null")
+                    .order("period")
+                    .range(offset, offset + PAGE - 1)
+                    .execute()
+                    .data or []
+                )
+            except Exception as e:
+                return f"=== Tándem ===\nError consultando qc de BIA: {e}"
+            if not chunk:
+                break
+            bia_rows.extend(chunk)
+            new_periods = {r["period"] for r in chunk if r.get("period")}
+            seen_periods |= new_periods
+            # Stop once qc stops changing (same period repeated) — means we've seen all
+            if len(chunk) < PAGE:
+                break
+            offset += PAGE
+        log.info("TANDEM BIA fallback scan | run_id=%s filas_raw=%d", bia_run_id, len(bia_rows))
 
     if not bia_rows:
         log.warning("TANDEM BIA sin datos | run_id=%s", bia_run_id)
