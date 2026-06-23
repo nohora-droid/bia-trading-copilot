@@ -34,6 +34,23 @@ _supabase: Client | None = None
 _claude: anthropic.Anthropic | None = None
 
 
+@app.on_event("startup")
+async def _ensure_tables():
+    """Create required tables if they don't exist yet."""
+    try:
+        sb = get_supabase()
+        sb.rpc("query", {"sql": (
+            "CREATE TABLE IF NOT EXISTS processed_events ("
+            "  event_ts TEXT PRIMARY KEY,"
+            "  processed_at TIMESTAMPTZ NOT NULL DEFAULT NOW()"
+            ");"
+        )}).execute()
+        log.info("STARTUP: processed_events table ensured")
+    except Exception as e:
+        # Log but don't crash — table may already exist or RPC may be unavailable
+        log.warning("STARTUP: could not ensure processed_events table: %s", e)
+
+
 def get_supabase() -> Client:
     global _supabase
     if _supabase is None:
@@ -53,29 +70,33 @@ def get_claude() -> anthropic.Anthropic:
 def _is_duplicate(event_ts: str) -> bool:
     """
     Returns True if this event_ts was already processed.
-    Uses INSERT to atomically claim the event; only a duplicate-key error (23505)
-    means the event was seen before. Any other error lets the event through so
-    an infra failure never silently drops a message.
-    Cleans up records older than 1 hour on every successful insert.
+    Uses upsert with ON CONFLICT DO NOTHING (ignore_duplicates=True).
+    PostgREST returns an empty data list when the row already existed,
+    and a one-element list when it was freshly inserted — that's our mutex.
+    Any infra error lets the event through so messages are never silently dropped.
     """
     sb = get_supabase()
     try:
-        sb.table("processed_events").insert({"event_ts": event_ts}).execute()
-        log.info("DEDUP INSERT OK | event_ts=%s", event_ts)
-        # Cleanup stale records — ignore any errors
-        try:
-            cutoff = (datetime.now(timezone.utc) - timedelta(hours=1)).isoformat()
-            sb.table("processed_events").delete().lt("processed_at", cutoff).execute()
-        except Exception:
-            pass
-        return False  # new event — process it
+        result = (
+            sb.table("processed_events")
+            .upsert({"event_ts": event_ts}, on_conflict="event_ts", ignore_duplicates=True)
+            .execute()
+        )
+        inserted = bool(result.data)  # empty list = conflict (already existed)
+        if inserted:
+            log.info("DEDUP INSERT OK | event_ts=%s", event_ts)
+            # Cleanup stale records — ignore errors
+            try:
+                cutoff = (datetime.now(timezone.utc) - timedelta(hours=1)).isoformat()
+                sb.table("processed_events").delete().lt("processed_at", cutoff).execute()
+            except Exception:
+                pass
+            return False  # new event — process it
+        else:
+            log.warning("DUPLICATE BLOCKED (upsert no-op): %s", event_ts)
+            return True  # already existed — duplicate
     except Exception as e:
-        err = str(e)
-        if "23505" in err or "duplicate" in err.lower() or "unique" in err.lower():
-            log.warning("DEDUP DUPLICATE KEY | event_ts=%s err=%.120s", event_ts, err)
-            return True  # genuine duplicate — skip
-        # Any other error (table missing, network, etc.) — log and process anyway
-        log.error("DEDUP INSERT ERROR (letting through) | event_ts=%s err=%.200s", event_ts, err)
+        log.error("DEDUP ERROR (letting through) | event_ts=%s err=%.200s", event_ts, e)
         return False
 
 # ── Constants ─────────────────────────────────────────────────────────────────
@@ -554,8 +575,6 @@ async def slack_events(request: Request, background_tasks: BackgroundTasks):
     if event.get("type") == "app_mention":
         # Claim atomically via Supabase PK — distributed mutex across all instances
         if event_ts and _is_duplicate(event_ts):
-            elapsed = (datetime.now(timezone.utc) - t0).total_seconds()
-            log.warning("DUPLICATE BLOCKED: %s | elapsed=%.3fs", event_ts, elapsed)
             return Response(status_code=200)
 
         log.info("PROCESSING: %s", event_ts)
