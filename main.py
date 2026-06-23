@@ -61,7 +61,8 @@ def _is_duplicate(event_ts: str) -> bool:
     sb = get_supabase()
     try:
         sb.table("processed_events").insert({"event_ts": event_ts}).execute()
-        # Cleanup stale records asynchronously — ignore any errors
+        log.info("DEDUP INSERT OK | event_ts=%s", event_ts)
+        # Cleanup stale records — ignore any errors
         try:
             cutoff = (datetime.now(timezone.utc) - timedelta(hours=1)).isoformat()
             sb.table("processed_events").delete().lt("processed_at", cutoff).execute()
@@ -69,11 +70,12 @@ def _is_duplicate(event_ts: str) -> bool:
             pass
         return False  # new event — process it
     except Exception as e:
-        # Postgres unique-violation code is 23505; treat only that as a duplicate
         err = str(e)
         if "23505" in err or "duplicate" in err.lower() or "unique" in err.lower():
-            return True  # genuine duplicate — skip silently
-        # Any other error (table missing, network, etc.) — process the event anyway
+            log.warning("DEDUP DUPLICATE KEY | event_ts=%s err=%.120s", event_ts, err)
+            return True  # genuine duplicate — skip
+        # Any other error (table missing, network, etc.) — log and process anyway
+        log.error("DEDUP INSERT ERROR (letting through) | event_ts=%s err=%.200s", event_ts, err)
         return False
 
 # ── Constants ─────────────────────────────────────────────────────────────────
@@ -553,9 +555,10 @@ async def slack_events(request: Request, background_tasks: BackgroundTasks):
         # Claim atomically via Supabase PK — distributed mutex across all instances
         if event_ts and _is_duplicate(event_ts):
             elapsed = (datetime.now(timezone.utc) - t0).total_seconds()
-            log.info("SLACK duplicate dropped | event_ts=%s elapsed=%.3fs", event_ts, elapsed)
+            log.warning("DUPLICATE BLOCKED: %s | elapsed=%.3fs", event_ts, elapsed)
             return Response(status_code=200)
 
+        log.info("PROCESSING: %s", event_ts)
         background_tasks.add_task(handle_mention, event)
 
     elapsed = (datetime.now(timezone.utc) - t0).total_seconds()
