@@ -273,7 +273,8 @@ _MONTH_NAMES = {
 # ── Intent detection ──────────────────────────────────────────────────────────
 
 _CU_KEYWORDS = re.compile(
-    r"\b(cu|costo unitario|tarifa|componente|g\b|c\b|t\b|d\b|p\b|r\b|g_base|desglose)\b",
+    r"\b(cu|costo unitario|tarifa|componente|g\b|c\b|t\b|d\b|p\b|r\b|g_base|desglose|"
+    r"riesgo|exposici[oó]n|escenario|qu[eé] pasa|pr[oó]ximos meses|aj\b|saldo)\b",
     re.IGNORECASE,
 )
 _SPREAD_KEYWORDS = re.compile(
@@ -285,7 +286,9 @@ _RUNS_KEYWORDS = re.compile(
     re.IGNORECASE,
 )
 _TANDEM_KEYWORDS = re.compile(
-    r"\b(t[aá]ndem|tandem|cobertura|banda|posici[oó]n|qc|contratar|contrataci[oó]n|priorizar|priorit|debo comprar|cu[aá]nto comprar)\b",
+    r"\b(t[aá]ndem|tandem|cobertura|banda|posici[oó]n|qc|contratar|contrataci[oó]n|"
+    r"priorizar|priorit|debo comprar|cu[aá]nto comprar|riesgo|exposici[oó]n|conviene|"
+    r"deber[ií]a|pr[oó]ximos\s+\d+\s+meses|qu[eé]\s+hago)\b",
     re.IGNORECASE,
 )
 
@@ -327,11 +330,16 @@ def _resolve_run(text: str, agent_code: str) -> dict | None:
 
     text_lower = text.lower()
 
-    # Person detection: exclude agent codes so "de BIA" doesn't match as a person
+    # Person detection — capture patterns like:
+    #   "corrió Allison", "ejecutó Juliana", "la corrida de Allison", "la de Juliana", "de Allison"
+    # Exclude agent codes (BIA, OR, EXEC…) so "de BIA" doesn't resolve as a person name.
     person_match = re.search(
-        r"(?:corri[oó]|ejecut[oó])\s+([a-záéíóúñ]+)",
+        r"(?:corri[oó]|ejecut[oó]|corrida\s+de|la\s+de)\s+([a-záéíóúñ]{3,})",
         text_lower,
     )
+    if not person_match:
+        # Fallback: bare "de <name>" where name is a known first name (≥4 chars, not an agent code)
+        person_match = re.search(r"\bde\s+([a-záéíóúñ]{4,})\b", text_lower)
     if person_match and person_match.group(1).lower() in _AGENT_CODES:
         person_match = None
 
@@ -641,24 +649,48 @@ def _ctx_spread(text: str) -> str:
     try:
         q = sb.table("spread_vs_competitors").select("*")
         if market_filter:
-            # Use ilike on normalized name — try first alias
             q = q.ilike("market", f"%{_normalize_market(market_filter[0])}%")
-        rows = q.limit(60).execute().data or []
+        rows = q.limit(200).execute().data or []
 
-        # If filter returned nothing, fall back to unfiltered
+        # If market filter returned nothing, fall back to unfiltered
         if not rows and market_filter:
-            rows = sb.table("spread_vs_competitors").select("*").limit(60).execute().data or []
+            rows = sb.table("spread_vs_competitors").select("*").limit(200).execute().data or []
     except Exception as e:
         return f"Vista spread_vs_competitors no disponible: {e}"
 
     if not rows:
         return "No hay datos en spread_vs_competitors."
 
-    lines = ["=== Spread vs competidores (spread_vs_competitors) ==="]
-    for r in rows[:30]:
+    # Identify which competitors are actually present so Claude can tell the user
+    competitors_present = sorted({r.get("competitor") for r in rows if r.get("competitor")})
+
+    lines = [
+        "=== Spread vs competidores (spread_vs_competitors) ===",
+        f"Competidores disponibles en la vista: {', '.join(competitors_present)}",
+    ]
+    # Detect if user asked about a specific competitor not present in the data
+    _COMP_ALIASES = {
+        "GNCC": ["vatia", "gncc"], "EXEC": ["enel x", "exec"], "ENBC": ["enerbit", "enbc"],
+        "NEUC": ["neu", "neuc"], "DLRC": ["diceler", "dlrc"], "ETTC": ["enertotal", "ettc"],
+        "QIEC": ["qi energy", "qiec"], "RTQC": ["ruitoque", "rtqc"], "SCEC": ["sol", "scec"],
+    }
+    text_l = text.lower()
+    asked_comp = next(
+        (code for code, aliases in _COMP_ALIASES.items()
+         if any(a in text_l for a in aliases)),
+        None
+    )
+    if asked_comp and asked_comp not in competitors_present:
+        lines.append(
+            f"AVISO: el competidor solicitado ({asked_comp}) no tiene datos en esta vista. "
+            f"Posiblemente su corrida no está en simulation_results. "
+            f"Competidores con datos: {', '.join(competitors_present)}"
+        )
+
+    for r in rows[:60]:
         lines.append("  " + "  ".join(f"{k}={v}" for k, v in r.items()))
-    if len(rows) > 30:
-        lines.append(f"  ... y {len(rows) - 30} filas mas.")
+    if len(rows) > 60:
+        lines.append(f"  ... y {len(rows) - 60} filas mas.")
     return "\n".join(lines)
 
 
