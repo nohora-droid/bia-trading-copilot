@@ -38,6 +38,34 @@ async def fetch_batch(client: httpx.AsyncClient, run_ids: list[int]) -> list[dic
     return data.get("runs", []) if isinstance(data, dict) else data
 
 
+# OR runs return market names instead of or_code — map them here
+_MARKET_TO_OR_CODE = {
+    "ANTIOQUIA": "EPM",
+    "BOGOTA": "ENEL",
+    "CUNDINAMARCA": "ENEL",
+    "BOYACA": "EBSA",
+    "CALDAS": "CHEC",
+    "CALI": "EMCALI",
+    "YUMBO": "EMCALI",
+    "CARIBE MAR": "AFINIA",
+    "CARIBE SOL": "AIRE",
+    "CARTAGO": "EEP",
+    "PEREIRA": "EEP",
+    "RISARALDA": "EEP",
+    "CASANARE": "ENERCA",
+    "CAUCA": "CEO",
+    "HUILA": "ELECTROHUILA",
+    "META": "EMSA",
+    "NARIÑO": "CEDENAR",
+    "NORTE SANTANDER": "CENS",
+    "QUINDIO": "EDEQ",
+    "SANTANDER": "ESSA",
+    "TOLIMA": "CELSIA TOLIMA",
+    "TULUA": "CETSA",
+    "VALLE": "CELSIA VALLE",
+}
+
+
 def flatten_run(run: dict, fetched_at: str) -> list[dict]:
     """Explode a run into one row per market+result combination."""
     rows = []
@@ -47,7 +75,10 @@ def flatten_run(run: dict, fetched_at: str) -> list[dict]:
 
     for market_entry in run.get("results_by_market", []):
         market = market_entry.get("market")
-        or_code = market_entry.get("or_code")
+        # API returns or_code=None for OR runs — resolve from market name
+        or_code = market_entry.get("or_code") or _MARKET_TO_OR_CODE.get(
+            (market or "").upper().strip(), None
+        )
 
         for res in market_entry.get("results", []):
             rows.append({
