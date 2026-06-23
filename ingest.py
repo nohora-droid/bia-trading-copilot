@@ -125,10 +125,14 @@ def save_rows(rows: list[dict]) -> None:
         supabase.table("simulation_results").insert(run_rows).execute()
 
 
-async def run_ingestion() -> None:
-    print("Obteniendo run_ids desde Supabase...")
-    run_ids = get_run_ids()
-    print(f"Total run_ids: {len(run_ids)}")
+async def run_ingestion(specific_ids: list[int] | None = None) -> None:
+    if specific_ids:
+        run_ids = specific_ids
+        print(f"Ingesta selectiva: {run_ids}")
+    else:
+        print("Obteniendo run_ids desde Supabase...")
+        run_ids = get_run_ids()
+        print(f"Total run_ids: {len(run_ids)}")
 
     if not run_ids:
         print("No hay run_ids para procesar.")
@@ -158,4 +162,6 @@ async def run_ingestion() -> None:
 
 
 if __name__ == "__main__":
-    asyncio.run(run_ingestion())
+    import sys
+    ids = [int(x) for x in sys.argv[1:]] if len(sys.argv) > 1 else None
+    asyncio.run(run_ingestion(ids))
