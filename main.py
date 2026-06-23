@@ -839,8 +839,10 @@ def _ctx_spread(text: str) -> str:
 
     competitors_present = sorted({r.get("competitor") for r in rows if r.get("competitor")})
     _ALL_KNOWN_COMPS = ["GNCC", "EXEC", "ENBC", "NEUC", "DLRC", "ETTC", "QIEC", "RTQC", "SCEC"]
-    _ALL_OR_COMPS = list(_OR_CODE_TO_BIA_MARKET.keys())
-    missing_comps = [c for c in _ALL_KNOWN_COMPS if c not in competitors_present]
+    _ALL_OR_COMPS = ["EPM", "ENEL", "EMCALI", "AFINIA", "AIRE", "CELSIA TOLIMA", "CELSIA VALLE",
+                     "EBSA", "CHEC", "ESSA", "EEP"]
+    all_expected = _ALL_KNOWN_COMPS + _ALL_OR_COMPS
+    missing_comps = [c for c in all_expected if c not in competitors_present]
 
     lines = [
         "=== Spread vs competidores comercializadores (spread_vs_competitors) ===",
