@@ -309,6 +309,14 @@ def _fmt_run(run: dict) -> str:
 
 
 _AGENT_CODES = {"neuc", "bia", "exec", "gncc", "or"}
+# Common Spanish words that match the "de <word>" person-name regex but are never names
+_EXCLUDED_PERSON_WORDS = _AGENT_CODES | {
+    "tandem", "tándem", "regla", "spread", "precio", "tarifa", "mercado",
+    "corrida", "simulacion", "simulación", "energia", "energía", "contrato",
+    "riesgo", "cobertura", "banda", "posicion", "posición", "escenario",
+    "componente", "costo", "ahorro", "periodo", "período", "dato", "datos",
+    "acuerdo", "resultado", "resultados", "hoy", "ayer", "mes", "año",
+}
 
 
 def _resolve_run(text: str, agent_code: str) -> dict | None:
@@ -340,7 +348,7 @@ def _resolve_run(text: str, agent_code: str) -> dict | None:
     if not person_match:
         # Fallback: bare "de <name>" where name is a known first name (≥4 chars, not an agent code)
         person_match = re.search(r"\bde\s+([a-záéíóúñ]{4,})\b", text_lower)
-    if person_match and person_match.group(1).lower() in _AGENT_CODES:
+    if person_match and person_match.group(1).lower() in _EXCLUDED_PERSON_WORDS:
         person_match = None
 
     wants_today     = bool(re.search(r"\bhoy\b", text_lower))
@@ -650,11 +658,11 @@ def _ctx_spread(text: str) -> str:
         q = sb.table("spread_vs_competitors").select("*")
         if market_filter:
             q = q.ilike("market", f"%{_normalize_market(market_filter[0])}%")
-        rows = q.limit(200).execute().data or []
+        rows = q.limit(60).execute().data or []
 
         # If market filter returned nothing, fall back to unfiltered
         if not rows and market_filter:
-            rows = sb.table("spread_vs_competitors").select("*").limit(200).execute().data or []
+            rows = sb.table("spread_vs_competitors").select("*").limit(60).execute().data or []
     except Exception as e:
         return f"Vista spread_vs_competitors no disponible: {e}"
 
