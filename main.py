@@ -619,9 +619,9 @@ def _ctx_spread(text: str) -> str:
 
 def _ctx_tandem(text: str) -> str:
     """
-    Builds tándem context: qc of BIA vs the 5+1 OR reference group.
-    Uses the most recent official run for BIA (agent_code='BIA') and OR runs.
-    Returns a formatted section ready for the LLM.
+    Builds tándem context: qc of BIA vs the OR reference group.
+    Both queries are scoped to a single run_id to avoid full-table scans on
+    the 500k+ row simulation_results table.
     """
     sb = get_supabase()
 
@@ -633,13 +633,19 @@ def _ctx_tandem(text: str) -> str:
     bia_run_id = bia_run["id"]
     bia_base   = bia_run.get("base_period", "")
 
-    # 2. Fetch qc for BIA — aggregate by period (avg across tension/rate variants)
+    # 2. Resolve the most recent official OR run (agent_code='OR' is the batch OR run)
+    or_run = _resolve_run(text, "OR")
+    if not or_run:
+        return "=== Tándem ===\nNo se encontró corrida oficial de OR para calcular tándem."
+
+    or_run_id = or_run["id"]
+
+    # 3. Fetch qc for BIA — scoped to run_id, only fields needed
     try:
         bia_rows = (
             sb.table("simulation_results")
             .select("period,qc")
             .eq("run_id", bia_run_id)
-            .eq("agent_code", "BIA")
             .eq("tension_level", 2)
             .eq("rate_type", "USER")
             .eq("pb_scenario", "MEDIUM")
@@ -660,36 +666,40 @@ def _ctx_tandem(text: str) -> str:
         if r.get("qc") is not None:
             bia_qc[r["period"]] = float(r["qc"]) * 100.0
 
-    # 3. Fetch qc for OR reference group — filter by or_code directly (no agent_code filter)
+    # 4. Fetch qc for OR reference group — scoped to or_run_id + or_code filter
     try:
         or_rows = (
             sb.table("simulation_results")
             .select("or_code,period,qc")
+            .eq("run_id", or_run_id)
             .in_("or_code", _TANDEM_OR_REFS)
             .eq("tension_level", 2)
             .eq("rate_type", "USER")
             .eq("pb_scenario", "MEDIUM")
             .order("period")
-            .limit(500)
+            .limit(200)
             .execute()
             .data or []
         )
     except Exception as e:
         return f"=== Tándem ===\nError consultando qc de OR de referencia: {e}"
 
-    # 4. Calculate per-period average qc of the OR reference group (converted to %)
+    # 5. Calculate per-period average qc of the OR reference group (converted to %)
     or_by_period: dict[str, list[float]] = defaultdict(list)
     for r in or_rows:
         if r.get("qc") is not None and r.get("period") and r.get("or_code") in _TANDEM_OR_REFS:
             or_by_period[r["period"]].append(float(r["qc"]) * 100.0)
 
-    # 5. Build output — one row per period
+    # 6. Build output — one row per period
     lines = [
         f"=== Tándem — posición de cobertura BIA vs OR de referencia ===",
         f"Corrida BIA: #{bia_run_id} | base_period={bia_base} | "
         f"fecha={bia_run.get('created_at','')[:10]} | "
         f"por={bia_run.get('triggered_by','')} | "
         f"oficial={'sí' if bia_run.get('is_official') else 'no'}",
+        f"Corrida OR:  #{or_run_id} | base_period={or_run.get('base_period','')} | "
+        f"fecha={or_run.get('created_at','')[:10]} | "
+        f"oficial={'sí' if or_run.get('is_official') else 'no'}",
         f"OR de referencia: {', '.join(_TANDEM_OR_REFS)}",
         f"(escenario: MEDIUM | tension_level=2 | rate_type=USER | qc expresado en %)",
         "",
