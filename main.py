@@ -632,6 +632,7 @@ def _ctx_tandem(text: str) -> str:
 
     bia_run_id = bia_run["id"]
     bia_base   = bia_run.get("base_period", "")
+    log.info("TANDEM BIA run resuelto | run_id=%s base=%s oficial=%s", bia_run_id, bia_base, bia_run.get("is_official"))
 
     # 2. Resolve the most recent official OR run (agent_code='OR' is the batch OR run)
     or_run = _resolve_run(text, "OR")
@@ -656,7 +657,13 @@ def _ctx_tandem(text: str) -> str:
     except Exception as e:
         return f"=== Tándem ===\nError consultando qc de BIA: {e}"
 
+    log.info("TANDEM BIA query | run_id=%s filas_raw=%d", bia_run_id, len(bia_rows))
+    if bia_rows:
+        sample = [(r.get("period"), r.get("qc")) for r in bia_rows[:5]]
+        log.info("TANDEM BIA sample (primeras 5): %s", sample)
+
     if not bia_rows:
+        log.warning("TANDEM BIA sin datos | run_id=%s", bia_run_id)
         return "=== Tándem ===\nSin datos de qc para BIA en la corrida oficial."
 
     # Build BIA qc dict: {period: qc_pct} — qc is uniform across all variants,
@@ -665,6 +672,8 @@ def _ctx_tandem(text: str) -> str:
     for r in bia_rows:
         if r.get("qc") is not None and r["period"] not in bia_qc:
             bia_qc[r["period"]] = float(r["qc"]) * 100.0
+
+    log.info("TANDEM BIA periodos deduplicados: %d | periodos=%s", len(bia_qc), sorted(bia_qc.keys()))
 
     # 4. Fetch qc for OR reference group — scoped to or_run_id + or_code filter
     try:
