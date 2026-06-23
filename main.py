@@ -845,3 +845,41 @@ async def slack_events(request: Request, background_tasks: BackgroundTasks):
 @app.get("/health")
 async def health():
     return {"status": "ok"}
+
+
+@app.get("/debug/tandem")
+async def debug_tandem():
+    """
+    Diagnostic: runs SELECT DISTINCT period, qc FROM simulation_results
+    WHERE run_id=21511 AND qc IS NOT NULL ORDER BY period
+    and returns the raw rows as JSON.
+    """
+    sb = get_supabase()
+    try:
+        rows = (
+            sb.table("simulation_results")
+            .select("period,qc")
+            .eq("run_id", 21511)
+            .not_.is_("qc", "null")
+            .order("period")
+            .limit(500)
+            .execute()
+            .data or []
+        )
+        # Deduplicate by period (same as _ctx_tandem)
+        seen: dict[str, float] = {}
+        for r in rows:
+            if r.get("period") and r.get("qc") is not None and r["period"] not in seen:
+                seen[r["period"]] = float(r["qc"])
+
+        return {
+            "run_id": 21511,
+            "raw_row_count": len(rows),
+            "distinct_periods": len(seen),
+            "periods": [
+                {"period": p, "qc_ratio": v, "qc_pct": round(v * 100, 2)}
+                for p, v in sorted(seen.items())
+            ],
+        }
+    except Exception as e:
+        return JSONResponse(status_code=500, content={"error": str(e)})
