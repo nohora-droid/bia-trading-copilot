@@ -1032,6 +1032,87 @@ def _ctx_tandem(text: str) -> str:
     return "\n".join(lines)
 
 
+def _ctx_cu_compare(run_a: dict, run_b: dict) -> str:
+    """
+    Load CU results for two specific runs and show a side-by-side delta.
+    run_a / run_b are rows from simulation_runs.
+    """
+    sb = get_supabase()
+
+    def _fetch_cu(run: dict) -> dict:
+        """Return {(market, period, scenario): cu} for a run."""
+        rows = (
+            sb.table("simulation_results")
+            .select("market,period,pb_scenario,cu,g,c,t,d,p,r")
+            .eq("run_id", run["id"])
+            .eq("tension_level", 2)
+            .eq("rate_type", "USER")
+            .order("period").order("market").order("pb_scenario")
+            .limit(1500)
+            .execute()
+            .data or []
+        )
+        index: dict = {}
+        for r in rows:
+            key = (r["market"], r["period"], r["pb_scenario"])
+            index[key] = r
+        return index
+
+    idx_a = _fetch_cu(run_a)
+    idx_b = _fetch_cu(run_b)
+
+    label_a = f"#{run_a['id']} ({(run_a.get('triggered_by') or '').split('@')[0]} | base {run_a.get('base_period')})"
+    label_b = f"#{run_b['id']} ({(run_b.get('triggered_by') or '').split('@')[0]} | base {run_b.get('base_period')})"
+
+    if not idx_a:
+        return f"=== Comparación de corridas ===\nSin datos en simulation_results para corrida {run_a['id']}."
+    if not idx_b:
+        return f"=== Comparación de corridas ===\nSin datos en simulation_results para corrida {run_b['id']}."
+
+    # Only compare keys that appear in both runs
+    common_keys = sorted(set(idx_a) & set(idx_b))
+    if not common_keys:
+        return (
+            f"=== Comparación de corridas ===\n"
+            f"No hay periodos/mercados en común entre {run_a['id']} y {run_b['id']}.\n"
+            f"Corrida A tiene {len(idx_a)} combinaciones, corrida B tiene {len(idx_b)} combinaciones."
+        )
+
+    lines = [
+        "=== Comparación de corridas — CU delta ===",
+        f"Corrida A: {label_a}",
+        f"Corrida B: {label_b}",
+        f"(tension_level=2, rate_type=USER | {len(common_keys)} combinaciones en común)",
+        "",
+    ]
+
+    # Group by (market, period) and list all scenarios
+    from itertools import groupby
+    def key2(k): return (k[0], k[1])
+
+    seen = set()
+    for k in common_keys:
+        group_key = key2(k)
+        if group_key in seen:
+            continue
+        seen.add(group_key)
+        market, period = group_key
+        scenarios = [kk[2] for kk in common_keys if key2(kk) == group_key]
+        parts = []
+        for sc in sorted(scenarios):
+            r_a = idx_a.get((market, period, sc), {})
+            r_b = idx_b.get((market, period, sc), {})
+            cu_a = float(r_a.get("cu") or 0)
+            cu_b = float(r_b.get("cu") or 0)
+            delta = round(cu_b - cu_a, 2)
+            sign = f"+{delta}" if delta > 0 else str(delta)
+            parts.append(f"{sc}: A={cu_a} B={cu_b} Δ={sign}")
+        lines.append(f"  {market} | {period} | " + " | ".join(parts))
+
+    log.info("CU COMPARE | run_a=%s run_b=%s common_keys=%d", run_a["id"], run_b["id"], len(common_keys))
+    return "\n".join(lines)
+
+
 def build_context(user_text: str) -> str:
     """Route to the right data sources based on the question's intent."""
     want_cu     = bool(_CU_KEYWORDS.search(user_text))
@@ -1042,11 +1123,47 @@ def build_context(user_text: str) -> str:
     if not any([want_cu, want_spread, want_runs, want_tandem]):
         want_runs = True
 
+    # Detect comparison between two named runs (e.g. "corrida de Allison y corrió Juliana")
+    raw_names = re.findall(
+        r"(?:corri[oó]|ejecut[oó]|corrida\s+de|la\s+de|de)\s+([a-záéíóúñ]{3,})",
+        user_text.lower(),
+    )
+    compare_names = [n for n in dict.fromkeys(raw_names) if n not in _EXCLUDED_PERSON_WORDS]
+    is_compare = len(compare_names) >= 2
+
     sections: list[str] = []
     if want_runs:
         sections.append(_ctx_simulation_runs(user_text))
-    if want_cu:
+
+    if is_compare:
+        # Fetch the most recent BIA run per person and compare their CU directly
+        sb = get_supabase()
+        runs_by_name: list[dict] = []
+        for name in compare_names[:2]:
+            r = (
+                sb.table("simulation_runs")
+                .select("id,agent_code,base_period,is_official,triggered_by,created_at,status")
+                .eq("agent_code", "BIA")
+                .eq("status", "COMPLETED")
+                .ilike("triggered_by", f"%{name}%")
+                .order("created_at", desc=True)
+                .limit(1)
+                .execute()
+                .data or []
+            )
+            if r:
+                runs_by_name.append(r[0])
+        if len(runs_by_name) == 2:
+            sections.append(_ctx_cu_compare(runs_by_name[0], runs_by_name[1]))
+        elif len(runs_by_name) == 1:
+            sections.append(
+                f"Solo encontré corrida de {compare_names[0]} (#{runs_by_name[0]['id']}). "
+                f"No hay corrida de {compare_names[1]} en simulation_runs."
+            )
+        log.info("COMPARE | names=%s runs=%s", compare_names, [r['id'] for r in runs_by_name])
+    elif want_cu:
         sections.append(_ctx_cu_components(user_text))
+
     if want_spread:
         sections.append(_ctx_spread(user_text))
     if want_tandem:
