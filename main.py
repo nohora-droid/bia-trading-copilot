@@ -640,15 +640,14 @@ def _ctx_tandem(text: str) -> str:
 
     or_run_id = or_run["id"]
 
-    # 3. Fetch qc for BIA — scoped to run_id, only fields needed
+    # 3. Fetch qc for BIA — qc is the same across all tension/rate/market variants,
+    #    so just grab distinct (period, qc) rows scoped to the run_id.
     try:
         bia_rows = (
             sb.table("simulation_results")
             .select("period,qc")
             .eq("run_id", bia_run_id)
-            .eq("tension_level", 2)
-            .eq("rate_type", "USER")
-            .eq("pb_scenario", "MEDIUM")
+            .not_.is_("qc", "null")
             .order("period")
             .limit(24)
             .execute()
@@ -660,10 +659,11 @@ def _ctx_tandem(text: str) -> str:
     if not bia_rows:
         return "=== Tándem ===\nSin datos de qc para BIA en la corrida oficial."
 
-    # Build BIA qc dict: {period: qc_pct} — qc is a ratio (0-1), convert to percentage
+    # Build BIA qc dict: {period: qc_pct} — qc is uniform across all variants,
+    # take first occurrence per period (dedup). Convert ratio → percentage.
     bia_qc: dict[str, float] = {}
     for r in bia_rows:
-        if r.get("qc") is not None:
+        if r.get("qc") is not None and r["period"] not in bia_qc:
             bia_qc[r["period"]] = float(r["qc"]) * 100.0
 
     # 4. Fetch qc for OR reference group — scoped to or_run_id + or_code filter
