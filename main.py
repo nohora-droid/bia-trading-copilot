@@ -284,6 +284,13 @@ _RUNS_KEYWORDS = re.compile(
     r"\b(corrida|simulaci[oó]n|run|reciente|[uú]ltim[ao]|ejecut|qui[eé]n corri[oó]|hoy|ayer)\b",
     re.IGNORECASE,
 )
+_TANDEM_KEYWORDS = re.compile(
+    r"\b(t[aá]ndem|tandem|cobertura|banda|posici[oó]n|qc)\b",
+    re.IGNORECASE,
+)
+
+# OR de referencia para el tándem (or_code tal como aparece en simulation_results)
+_TANDEM_OR_REFS = ["ENEL", "EMCALI", "AIRE", "AFINIA", "CELSIA TOLIMA", "CELSIA VALLE", "EPM"]
 
 # ── Run resolution ────────────────────────────────────────────────────────────
 
@@ -610,13 +617,136 @@ def _ctx_spread(text: str) -> str:
     return "\n".join(lines)
 
 
+def _ctx_tandem(text: str) -> str:
+    """
+    Builds tándem context: qc of BIA vs the 5+1 OR reference group.
+    Uses the most recent official run for BIA (agent_code='BIA') and OR runs.
+    Returns a formatted section ready for the LLM.
+    """
+    sb = get_supabase()
+
+    # 1. Resolve the most recent official BIA run
+    bia_run = _resolve_run(text, "BIA")
+    if not bia_run:
+        return "=== Tándem ===\nNo se encontró corrida oficial de BIA para calcular tándem."
+
+    bia_run_id = bia_run["id"]
+    bia_base   = bia_run.get("base_period", "")
+
+    # 2. Fetch qc for BIA — aggregate by period (avg across tension/rate variants)
+    try:
+        bia_rows = (
+            sb.table("simulation_results")
+            .select("period,qc")
+            .eq("run_id", bia_run_id)
+            .eq("agent_code", "BIA")
+            .eq("tension_level", 2)
+            .eq("rate_type", "USER")
+            .eq("pb_scenario", "MEDIUM")
+            .order("period")
+            .limit(24)
+            .execute()
+            .data or []
+        )
+    except Exception as e:
+        return f"=== Tándem ===\nError consultando qc de BIA: {e}"
+
+    if not bia_rows:
+        return "=== Tándem ===\nSin datos de qc para BIA en la corrida oficial."
+
+    # Build BIA qc dict: {period: qc}
+    bia_qc: dict[str, float] = {}
+    for r in bia_rows:
+        if r.get("qc") is not None:
+            bia_qc[r["period"]] = float(r["qc"])
+
+    # 3. Fetch qc for OR reference group
+    # OR runs use agent_code='OR'; filter by or_code for the specific operators
+    try:
+        or_rows = (
+            sb.table("simulation_results")
+            .select("or_code,period,qc")
+            .eq("agent_code", "OR")
+            .in_("or_code", _TANDEM_OR_REFS)
+            .eq("tension_level", 2)
+            .eq("rate_type", "USER")
+            .eq("pb_scenario", "MEDIUM")
+            .order("period")
+            .limit(500)
+            .execute()
+            .data or []
+        )
+    except Exception as e:
+        return f"=== Tándem ===\nError consultando qc de OR de referencia: {e}"
+
+    # 4. Calculate per-period average qc of the OR reference group
+    or_by_period: dict[str, list[float]] = defaultdict(list)
+    for r in or_rows:
+        if r.get("qc") is not None and r.get("period") and r.get("or_code") in _TANDEM_OR_REFS:
+            or_by_period[r["period"]].append(float(r["qc"]))
+
+    # 5. Build output — one row per period
+    lines = [
+        f"=== Tándem — posición de cobertura BIA vs OR de referencia ===",
+        f"Corrida BIA: #{bia_run_id} | base_period={bia_base} | "
+        f"fecha={bia_run.get('created_at','')[:10]} | "
+        f"por={bia_run.get('triggered_by','')} | "
+        f"oficial={'sí' if bia_run.get('is_official') else 'no'}",
+        f"OR de referencia: {', '.join(_TANDEM_OR_REFS)}",
+        f"(escenario: MEDIUM | tension_level=2 | rate_type=USER)",
+        "",
+        f"{'Periodo':<10} {'qc_BIA':>8} {'qc_OR_avg':>10} {'banda_low':>10} {'banda_high':>11} {'estado':>12}",
+        "-" * 65,
+    ]
+
+    all_periods = sorted(set(bia_qc.keys()) | set(or_by_period.keys()))
+    for period in all_periods:
+        qc_bia = bia_qc.get(period)
+        or_vals = or_by_period.get(period, [])
+        if not or_vals:
+            qc_or_avg = band_low = band_high = None
+            estado = "sin datos OR"
+        else:
+            qc_or_avg = sum(or_vals) / len(or_vals)
+            band_low  = qc_or_avg - 5.0
+            band_high = qc_or_avg + 5.0
+            if qc_bia is None:
+                estado = "sin datos BIA"
+            elif qc_bia < band_low:
+                estado = "⬇ BAJO banda"
+            elif qc_bia > band_high:
+                estado = "⬆ SOBRE banda"
+            else:
+                estado = "✅ en banda"
+
+        bia_str  = f"{qc_bia:.1f}%" if qc_bia is not None else "  N/A"
+        avg_str  = f"{qc_or_avg:.1f}%" if qc_or_avg is not None else "  N/A"
+        low_str  = f"{band_low:.1f}%" if band_low is not None else "  N/A"
+        high_str = f"{band_high:.1f}%" if band_high is not None else "  N/A"
+        lines.append(f"{period:<10} {bia_str:>8} {avg_str:>10} {low_str:>10} {high_str:>11} {estado:>12}")
+
+    # Summary counts for the LLM
+    n_below = sum(1 for p in all_periods
+                  if bia_qc.get(p) is not None and or_by_period.get(p)
+                  and bia_qc[p] < (sum(or_by_period[p]) / len(or_by_period[p])) - 5.0)
+    n_above = sum(1 for p in all_periods
+                  if bia_qc.get(p) is not None and or_by_period.get(p)
+                  and bia_qc[p] > (sum(or_by_period[p]) / len(or_by_period[p])) + 5.0)
+    n_in    = len(all_periods) - n_below - n_above
+    lines.append("")
+    lines.append(f"Resumen: {n_in} periodos en banda | {n_below} por debajo | {n_above} por encima")
+
+    return "\n".join(lines)
+
+
 def build_context(user_text: str) -> str:
     """Route to the right data sources based on the question's intent."""
     want_cu     = bool(_CU_KEYWORDS.search(user_text))
     want_spread = bool(_SPREAD_KEYWORDS.search(user_text))
     want_runs   = bool(_RUNS_KEYWORDS.search(user_text))
+    want_tandem = bool(_TANDEM_KEYWORDS.search(user_text))
 
-    if not any([want_cu, want_spread, want_runs]):
+    if not any([want_cu, want_spread, want_runs, want_tandem]):
         want_runs = True
 
     sections: list[str] = []
@@ -626,6 +756,8 @@ def build_context(user_text: str) -> str:
         sections.append(_ctx_cu_components(user_text))
     if want_spread:
         sections.append(_ctx_spread(user_text))
+    if want_tandem:
+        sections.append(_ctx_tandem(user_text))
 
     return "\n\n".join(sections)
 
