@@ -285,7 +285,7 @@ _RUNS_KEYWORDS = re.compile(
     re.IGNORECASE,
 )
 _TANDEM_KEYWORDS = re.compile(
-    r"\b(t[aá]ndem|tandem|cobertura|banda|posici[oó]n|qc)\b",
+    r"\b(t[aá]ndem|tandem|cobertura|banda|posici[oó]n|qc|contratar|contrataci[oó]n|priorizar|priorit|debo comprar|cu[aá]nto comprar)\b",
     re.IGNORECASE,
 )
 
@@ -351,10 +351,21 @@ def _resolve_run(text: str, agent_code: str) -> dict | None:
             builder = builder.eq(k, v)
         return builder
 
-    # Strategy 1 — person name
+    # Strategy 1 — person name: search any run (official or not) with partial match
     if person_match:
         name = person_match.group(1).strip()
-        rows = q().ilike("triggered_by", f"{name}%").order("created_at", desc=True).limit(1).execute().data or []
+        # Build fresh query without is_official filter so comparisons across runs work
+        rows = (
+            sb.table("simulation_runs")
+            .select("id,agent_code,base_period,is_official,triggered_by,created_at,status")
+            .eq("agent_code", agent_code)
+            .eq("status", "COMPLETED")
+            .ilike("triggered_by", f"%{name}%")
+            .order("created_at", desc=True)
+            .limit(1)
+            .execute()
+            .data or []
+        )
         if rows:
             return rows[0]
 
@@ -593,16 +604,50 @@ def _ctx_cu_components(text: str) -> str:
     return "\n".join(lines)
 
 
+def _normalize_market(name: str) -> str:
+    """Remove accents and uppercase for consistent market name comparison."""
+    return unicodedata.normalize("NFD", name).encode("ascii", "ignore").decode().upper().strip()
+
+_MARKET_ALIASES: dict[str, list[str]] = {
+    "BOGOTA":    ["BOGOTA", "BOGOTÁ", "BOGOTA D.C.", "BOGOTÁ D.C."],
+    "MEDELLIN":  ["MEDELLIN", "MEDELLÍN"],
+    "NARINO":    ["NARINO", "NARIÑO"],
+    "QUINDIO":   ["QUINDIO", "QUINDÍO"],
+    "CALI":      ["CALI", "SANTIAGO DE CALI"],
+}
+
 def _ctx_spread(text: str) -> str:
     sb = get_supabase()
-    try:
-        rows = (
-            sb.table("spread_vs_competitors")
-            .select("*")
-            .limit(60)
-            .execute()
-            .data or []
+
+    # Detect market mention in the question and build filter candidates
+    text_norm = _normalize_market(text)
+    market_filter: list[str] | None = None
+    for canonical, aliases in _MARKET_ALIASES.items():
+        if any(_normalize_market(a) in text_norm for a in aliases) or canonical in text_norm:
+            market_filter = aliases
+            break
+    # Also catch any single word that looks like a Colombian market name
+    if not market_filter:
+        market_match = re.search(
+            r"\b(bogot[aá]|medell[ií]n|cali|antioquia|barranquilla|cartagena|"
+            r"tolima|boyac[aá]|caldas|risaralda|santander|huila|valle|cauca|"
+            r"nari[nñ]o|caribe|cundinamarca|meta|casanare|qu[ií]nd[ií]o)\b",
+            text, re.IGNORECASE,
         )
+        if market_match:
+            word = _normalize_market(market_match.group(1))
+            market_filter = [market_match.group(1)]  # raw — ilike handles it
+
+    try:
+        q = sb.table("spread_vs_competitors").select("*")
+        if market_filter:
+            # Use ilike on normalized name — try first alias
+            q = q.ilike("market", f"%{_normalize_market(market_filter[0])}%")
+        rows = q.limit(60).execute().data or []
+
+        # If filter returned nothing, fall back to unfiltered
+        if not rows and market_filter:
+            rows = sb.table("spread_vs_competitors").select("*").limit(60).execute().data or []
     except Exception as e:
         return f"Vista spread_vs_competitors no disponible: {e}"
 
