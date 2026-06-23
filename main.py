@@ -429,8 +429,13 @@ def _ctx_simulation_runs(text: str) -> str:
     text_lower = text.lower()
     wants_compare = bool(re.search(r"\bcompar\w*\b", text_lower))
 
-    # Detect person filter
-    person_match = re.search(r"(?:corri[oó]|ejecut[oó]|de)\s+([a-záéíóúñ]+)", text_lower)
+    # Find ALL person names mentioned (e.g. "corrida de Allison y ... corrió Juliana")
+    raw_names = re.findall(
+        r"(?:corri[oó]|ejecut[oó]|corrida\s+de|la\s+de|de)\s+([a-záéíóúñ]{3,})",
+        text_lower,
+    )
+    person_names = [n for n in dict.fromkeys(raw_names) if n not in _EXCLUDED_PERSON_WORDS]
+
     wants_today     = bool(re.search(r"\bhoy\b", text_lower))
     wants_yesterday = bool(re.search(r"\bayer\b", text_lower))
 
@@ -438,20 +443,38 @@ def _ctx_simulation_runs(text: str) -> str:
     today_start = now_utc.replace(hour=0, minute=0, second=0, microsecond=0)
     yesterday_start = today_start - timedelta(days=1)
 
-    q = (
-        sb.table("simulation_runs")
-        .select("id,agent_code,base_period,is_official,triggered_by,created_at,status")
-        .eq("status", "COMPLETED")
-    )
+    def _base_q():
+        return (
+            sb.table("simulation_runs")
+            .select("id,agent_code,base_period,is_official,triggered_by,created_at,status")
+            .eq("status", "COMPLETED")
+        )
 
-    if person_match:
-        q = q.ilike("triggered_by", f"{person_match.group(1).strip()}%")
+    rows: list[dict] = []
+
+    if person_names:
+        # Fetch the most recent run per person (contains search, not prefix)
+        seen_ids: set = set()
+        for name in person_names:
+            person_rows = (
+                _base_q()
+                .ilike("triggered_by", f"%{name}%")
+                .order("created_at", desc=True)
+                .limit(5)
+                .execute()
+                .data or []
+            )
+            for r in person_rows:
+                if r["id"] not in seen_ids:
+                    seen_ids.add(r["id"])
+                    rows.append(r)
+        log.info("RUNS person_names=%s found=%d", person_names, len(rows))
     elif wants_today:
-        q = q.gte("created_at", today_start.isoformat())
+        rows = _base_q().gte("created_at", today_start.isoformat()).order("created_at", desc=True).limit(20).execute().data or []
     elif wants_yesterday:
-        q = q.gte("created_at", yesterday_start.isoformat()).lt("created_at", today_start.isoformat())
-
-    rows = q.order("created_at", desc=True).limit(20).execute().data or []
+        rows = _base_q().gte("created_at", yesterday_start.isoformat()).lt("created_at", today_start.isoformat()).order("created_at", desc=True).limit(20).execute().data or []
+    else:
+        rows = _base_q().order("created_at", desc=True).limit(20).execute().data or []
 
     if not rows:
         return "No se encontraron corridas con esos criterios."
@@ -671,10 +694,14 @@ def _ctx_spread(text: str) -> str:
 
     # Identify which competitors are actually present so Claude can tell the user
     competitors_present = sorted({r.get("competitor") for r in rows if r.get("competitor")})
+    _ALL_KNOWN_COMPS = ["GNCC", "EXEC", "ENBC", "NEUC", "DLRC", "ETTC", "QIEC", "RTQC", "SCEC"]
+    missing_comps = [c for c in _ALL_KNOWN_COMPS if c not in competitors_present]
 
     lines = [
         "=== Spread vs competidores (spread_vs_competitors) ===",
-        f"Competidores disponibles en la vista: {', '.join(competitors_present)}",
+        f"Competidores CON datos en la vista: {', '.join(competitors_present) if competitors_present else 'ninguno'}",
+        f"Competidores SIN datos en la vista: {', '.join(missing_comps) if missing_comps else 'ninguno'}",
+        "AVISO: responde solo con los competidores que tienen datos — menciona explicitamente cuales faltan.",
     ]
     # Detect if user asked about a specific competitor not present in the data
     _COMP_ALIASES = {
