@@ -641,8 +641,8 @@ def _ctx_tandem(text: str) -> str:
 
     or_run_id = or_run["id"]
 
-    # 3. Fetch qc for BIA — qc is the same across all tension/rate/market variants,
-    #    so just grab distinct (period, qc) rows scoped to the run_id.
+    # 3. Fetch qc for BIA — qc is uniform across all variants per period.
+    # limit(300) = 12 periodos × ~25 variantes; dedup in Python takes first per period.
     try:
         bia_rows = (
             sb.table("simulation_results")
@@ -650,7 +650,7 @@ def _ctx_tandem(text: str) -> str:
             .eq("run_id", bia_run_id)
             .not_.is_("qc", "null")
             .order("period")
-            .limit(24)
+            .limit(300)
             .execute()
             .data or []
         )
