@@ -278,7 +278,9 @@ _CU_KEYWORDS = re.compile(
     re.IGNORECASE,
 )
 _SPREAD_KEYWORDS = re.compile(
-    r"\b(spread|competidor|competencia|competitiv|rival|vs\b|versus|comparar|diferencia)\b",
+    r"\b(spread|competidor|competencia|competitiv|rival|vs\b|versus|comparar|diferencia|"
+    r"epm|emcali|afinia|codensa|ebsa|chec|essa|eep|electrohuila|emsa|cedenar|cens|edeq|enerca|cetsa)\b"
+    r"|celsia\s+(tolima|valle)|enel\s+(bogot[aá]|or\b)|caribe\s+sol",
     re.IGNORECASE,
 )
 _RUNS_KEYWORDS = re.compile(
@@ -655,9 +657,155 @@ _MARKET_ALIASES: dict[str, list[str]] = {
     "CALI":      ["CALI", "SANTIAGO DE CALI"],
 }
 
-def _ctx_spread(text: str) -> str:
+# OR operators as competitors: text aliases → or_code in simulation_results
+_OR_COMP_ALIASES: dict[str, list[str]] = {
+    "EPM":           ["epm", "empresas publicas", "empresas públicas"],
+    "ENEL":          ["enel bogota", "enel bogotá", "codensa", "enel or"],
+    "EMCALI":        ["emcali"],
+    "AFINIA":        ["afinia"],
+    "AIRE":          ["aire caribe", "caribe sol"],
+    "CELSIA TOLIMA": ["celsia tolima"],
+    "CELSIA VALLE":  ["celsia valle"],
+    "EBSA":          ["ebsa"],
+    "CHEC":          ["chec"],
+    "ESSA":          ["essa"],
+    "EEP":           ["eep"],
+    "ELECTROHUILA":  ["electrohuila"],
+    "EMSA":          ["emsa"],
+    "CEO":           ["ceo cauca"],
+    "CEDENAR":       ["cedenar"],
+    "CENS":          ["cens"],
+    "EDEQ":          ["edeq"],
+    "ENERCA":        ["enerca"],
+    "CETSA":         ["cetsa"],
+}
+
+# Map or_code → BIA market name (for filtering BIA results)
+_OR_CODE_TO_BIA_MARKET: dict[str, str] = {
+    "EPM":           "ANTIOQUIA",
+    "ENEL":          "BOGOTA",
+    "EMCALI":        "CALI",
+    "AFINIA":        "CARIBE MAR",
+    "AIRE":          "CARIBE SOL",
+    "CELSIA TOLIMA": "TOLIMA",
+    "CELSIA VALLE":  "VALLE",
+    "EBSA":          "BOYACA",
+    "CHEC":          "CALDAS",
+    "ESSA":          "SANTANDER",
+    "EEP":           "PEREIRA",
+    "ELECTROHUILA":  "HUILA",
+    "EMSA":          "META",
+    "CEO":           "CAUCA",
+    "CEDENAR":       "NARINO",
+    "CENS":          "NORTE SANTANDER",
+    "EDEQ":          "QUINDIO",
+    "ENERCA":        "CASANARE",
+    "CETSA":         "TULUA",
+}
+
+
+def _ctx_spread_or(text: str, or_code: str) -> str:
+    """Compute spread BIA vs an OR operator directly from simulation_results."""
     sb = get_supabase()
 
+    bia_run = _resolve_run(text, "BIA")
+    if not bia_run:
+        return "No se encontró corrida oficial de BIA."
+    or_run = _resolve_run(text, "OR")
+    if not or_run:
+        return "No se encontró corrida oficial de OR."
+
+    bia_market = _OR_CODE_TO_BIA_MARKET.get(or_code)
+    bia_run_id = bia_run["id"]
+    or_run_id  = or_run["id"]
+
+    # BIA rows for the relevant market
+    bia_q = (
+        sb.table("simulation_results")
+        .select("market,period,pb_scenario,cu,g,t,d,c,p,r")
+        .eq("run_id", bia_run_id)
+        .eq("tension_level", 2)
+        .eq("rate_type", "USER")
+        .order("period").order("pb_scenario")
+        .limit(200)
+    )
+    if bia_market:
+        bia_q = bia_q.ilike("market", f"%{bia_market}%")
+    bia_rows = bia_q.execute().data or []
+
+    # OR rows for this or_code
+    or_rows = (
+        sb.table("simulation_results")
+        .select("or_code,period,pb_scenario,cu")
+        .eq("run_id", or_run_id)
+        .eq("or_code", or_code)
+        .eq("tension_level", 2)
+        .eq("rate_type", "USER")
+        .order("period").order("pb_scenario")
+        .limit(200)
+        .execute()
+        .data or []
+    )
+
+    if not bia_rows:
+        return f"No hay datos BIA para el mercado de {or_code} ({bia_market})."
+    if not or_rows:
+        return f"No hay datos OR para or_code={or_code} en la corrida OR #{or_run_id}."
+
+    # Index OR by (period, scenario)
+    or_index: dict = {}
+    for r in or_rows:
+        or_index[(r["period"], r["pb_scenario"])] = float(r["cu"] or 0)
+
+    # Index BIA by (market, period, scenario) → avg cu
+    from collections import defaultdict
+    bia_groups: dict = defaultdict(list)
+    for r in bia_rows:
+        bia_groups[(r["market"], r["period"], r["pb_scenario"])].append(float(r["cu"] or 0))
+
+    lines = [
+        f"=== Spread BIA vs {or_code} (OR) ===",
+        f"Corrida BIA: #{bia_run_id} | base {bia_run.get('base_period')} | {bia_run.get('triggered_by')} | oficial: {'sí' if bia_run.get('is_official') else 'no'}",
+        f"Corrida OR:  #{or_run_id} | base {or_run.get('base_period')} | oficial: {'sí' if or_run.get('is_official') else 'no'}",
+        f"Nota: {or_code} es un Operador de Red (OR) — competidor de BIA en su mercado ({bia_market or 'varios'})",
+        "(tension_level=2, rate_type=USER)",
+    ]
+
+    for (market, period, scenario), bia_cus in sorted(bia_groups.items()):
+        bia_cu = round(sum(bia_cus) / len(bia_cus), 2)
+        or_cu  = or_index.get((period, scenario))
+        if or_cu:
+            spread = round(bia_cu - or_cu, 2)
+            sign   = f"+{spread}" if spread > 0 else str(spread)
+            lines.append(
+                f"  {market} | {period} | {scenario}: BIA={bia_cu}  {or_code}={round(or_cu,2)}  spread={sign}"
+            )
+        else:
+            lines.append(f"  {market} | {period} | {scenario}: BIA={bia_cu}  {or_code}=sin dato")
+
+    log.info("SPREAD OR | or_code=%s bia_rows=%d or_rows=%d", or_code, len(bia_rows), len(or_rows))
+    return "\n".join(lines)
+
+
+def _ctx_spread(text: str) -> str:
+    sb = get_supabase()
+    text_l = text.lower()
+
+    # Check if the user is asking about an OR operator specifically
+    asked_or = next(
+        (code for code, aliases in _OR_COMP_ALIASES.items()
+         if any(a in text_l for a in aliases)),
+        None,
+    )
+    # "enel" alone (without "x" or "bogotá") is ambiguous — prefer OR interpretation
+    # since EXEC aliases use "enel x" explicitly; bare "enel" = OR operator
+    if not asked_or and "enel" in text_l and "enel x" not in text_l:
+        asked_or = "ENEL"
+
+    if asked_or:
+        return _ctx_spread_or(text, asked_or)
+
+    # ── Comercializadores path (existing view) ────────────────────────────────
     # Detect market mention in the question and build filter candidates
     text_norm = _normalize_market(text)
     market_filter: list[str] | None = None
@@ -665,7 +813,6 @@ def _ctx_spread(text: str) -> str:
         if any(_normalize_market(a) in text_norm for a in aliases) or canonical in text_norm:
             market_filter = aliases
             break
-    # Also catch any single word that looks like a Colombian market name
     if not market_filter:
         market_match = re.search(
             r"\b(bogot[aá]|medell[ií]n|cali|antioquia|barranquilla|cartagena|"
@@ -674,8 +821,7 @@ def _ctx_spread(text: str) -> str:
             text, re.IGNORECASE,
         )
         if market_match:
-            word = _normalize_market(market_match.group(1))
-            market_filter = [market_match.group(1)]  # raw — ilike handles it
+            market_filter = [market_match.group(1)]
 
     try:
         q = sb.table("spread_vs_competitors").select("*")
@@ -683,7 +829,6 @@ def _ctx_spread(text: str) -> str:
             q = q.ilike("market", f"%{_normalize_market(market_filter[0])}%")
         rows = q.limit(60).execute().data or []
 
-        # If market filter returned nothing, fall back to unfiltered
         if not rows and market_filter:
             rows = sb.table("spread_vs_competitors").select("*").limit(60).execute().data or []
     except Exception as e:
@@ -692,33 +837,32 @@ def _ctx_spread(text: str) -> str:
     if not rows:
         return "No hay datos en spread_vs_competitors."
 
-    # Identify which competitors are actually present so Claude can tell the user
     competitors_present = sorted({r.get("competitor") for r in rows if r.get("competitor")})
     _ALL_KNOWN_COMPS = ["GNCC", "EXEC", "ENBC", "NEUC", "DLRC", "ETTC", "QIEC", "RTQC", "SCEC"]
+    _ALL_OR_COMPS = list(_OR_CODE_TO_BIA_MARKET.keys())
     missing_comps = [c for c in _ALL_KNOWN_COMPS if c not in competitors_present]
 
     lines = [
-        "=== Spread vs competidores (spread_vs_competitors) ===",
+        "=== Spread vs competidores comercializadores (spread_vs_competitors) ===",
         f"Competidores CON datos en la vista: {', '.join(competitors_present) if competitors_present else 'ninguno'}",
         f"Competidores SIN datos en la vista: {', '.join(missing_comps) if missing_comps else 'ninguno'}",
+        f"OR como competidores (consulta directa disponible): {', '.join(_ALL_OR_COMPS)}",
         "AVISO: responde solo con los competidores que tienen datos — menciona explicitamente cuales faltan.",
     ]
-    # Detect if user asked about a specific competitor not present in the data
+
     _COMP_ALIASES = {
         "GNCC": ["vatia", "gncc"], "EXEC": ["enel x", "exec"], "ENBC": ["enerbit", "enbc"],
         "NEUC": ["neu", "neuc"], "DLRC": ["diceler", "dlrc"], "ETTC": ["enertotal", "ettc"],
         "QIEC": ["qi energy", "qiec"], "RTQC": ["ruitoque", "rtqc"], "SCEC": ["sol", "scec"],
     }
-    text_l = text.lower()
     asked_comp = next(
         (code for code, aliases in _COMP_ALIASES.items()
          if any(a in text_l for a in aliases)),
-        None
+        None,
     )
     if asked_comp and asked_comp not in competitors_present:
         lines.append(
             f"AVISO: el competidor solicitado ({asked_comp}) no tiene datos en esta vista. "
-            f"Posiblemente su corrida no está en simulation_results. "
             f"Competidores con datos: {', '.join(competitors_present)}"
         )
 
