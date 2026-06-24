@@ -1489,57 +1489,31 @@ async def handle_mention(event: dict) -> None:
 
 # ── Endpoints ─────────────────────────────────────────────────────────────────
 
-async def _process_event(body: dict) -> None:
-    """
-    Runs in a background task — called AFTER the 200 has already been sent.
-    Deduplicates via INSERT (unique PK): if the row already exists Supabase
-    raises a unique-violation and we bail out silently.
-    """
-    event = body.get("event", {})
-    if event.get("type") != "app_mention":
-        return
-
-    event_ts = event.get("event_ts") or event.get("ts", "")
-    if not event_ts:
-        log.warning("PROCESS EVENT: no event_ts, skipping")
-        return
-
-    sb = get_supabase()
-    try:
-        result = (
-            sb.table("processed_events")
-            .upsert({"event_ts": event_ts}, on_conflict="event_ts", ignore_duplicates=True)
-            .execute()
-        )
-        if not result.data:
-            log.warning("DUPLICATE BLOCKED | event_ts=%s", event_ts)
-            return
-        log.info("DEDUP OK | event_ts=%s", event_ts)
-        # Cleanup old records (best-effort)
-        try:
-            cutoff = (datetime.now(timezone.utc) - timedelta(hours=1)).isoformat()
-            sb.table("processed_events").delete().lt("processed_at", cutoff).execute()
-        except Exception:
-            pass
-    except Exception as e:
-        log.error("DEDUP ERROR | event_ts=%s err=%.200s", event_ts, e)
-        return  # Don't process if we can't deduplicate
-
-    await handle_mention(event)
-
-
 @app.post("/slack/events")
 async def slack_events(request: Request, background_tasks: BackgroundTasks):
+    t0 = datetime.now(timezone.utc)
     body = await request.json()
 
-    # URL verification — must respond synchronously with the challenge value
+    # URL verification challenge
     if body.get("type") == "url_verification":
-        log.info("SLACK challenge received")
-        return JSONResponse({"challenge": body.get("challenge")})
+        log.info("SLACK challenge received — responding immediately")
+        return JSONResponse({"challenge": body["challenge"]})
 
-    # Respond 200 IMMEDIATELY — Slack requires a response within 3 seconds.
-    # All deduplication and processing happen in the background task.
-    background_tasks.add_task(_process_event, body)
+    event    = body.get("event", {})
+    event_ts = event.get("event_ts") or event.get("ts", "")
+
+    log.info("SLACK event received | type=%s event_ts=%s t=%s",
+             event.get("type"), event_ts, t0.isoformat())
+
+    if event.get("type") == "app_mention":
+        if event_ts and _is_duplicate(event_ts):
+            return Response(status_code=200)
+
+        log.info("PROCESSING: %s", event_ts)
+        background_tasks.add_task(handle_mention, event)
+
+    elapsed = (datetime.now(timezone.utc) - t0).total_seconds()
+    log.info("SLACK 200 sent | event_ts=%s elapsed=%.3fs", event_ts, elapsed)
     return Response(status_code=200)
 
 
