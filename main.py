@@ -293,6 +293,15 @@ _RUNS_KEYWORDS = re.compile(
     r"\b(corrida|simulaci[oó]n|run|reciente|[uú]ltim[ao]|ejecut|qui[eé]n corri[oó]|hoy|ayer)\b",
     re.IGNORECASE,
 )
+_OR_RANKING_KEYWORDS = re.compile(
+    r"\b(qu[eé]\s+or|cu[aá]l\s+or|or\s+m[aá]s\s+barat\w*|or\s+m[aá]s\s+car\w*|"
+    r"m[aá]s\s+barat\w*.*\bor\b|\bor\b.*m[aá]s\s+barat\w*|"
+    r"tarifa\s+m[aá]s\s+baj\w*.*\bor\b|\bor\b.*tarifa\s+m[aá]s\s+baj\w*|"
+    r"menor\s+tarifa.*\bor\b|\bor\b.*menor\s+tarifa|"
+    r"cu\s+m[aá]s\s+baj\w*.*\bor\b|\bor\b.*cu\s+m[aá]s\s+baj\w*|"
+    r"ranking.*\bor\b|\bor\b.*ranking)\b",
+    re.IGNORECASE,
+)
 _TANDEM_KEYWORDS = re.compile(
     r"\b(t[aá]ndem|tandem|cobertura|banda|posici[oó]n|qc|contratar|contrataci[oó]n|"
     r"priorizar|priorit|debo comprar|cu[aá]nto comprar|riesgo|exposici[oó]n|conviene|"
@@ -788,6 +797,81 @@ _OR_CODE_TO_BIA_MARKET: dict[str, str] = {
     "ENERCA":        "CASANARE",
     "CETSA":         "TULUA",
 }
+
+
+def _ctx_or_ranking_by_period(text: str) -> str:
+    """Rank all OR operators by CU for a period range — answers 'qué OR tiene la tarifa más baja'."""
+    sb = get_supabase()
+
+    or_run = _resolve_run(text, "OR")
+    if not or_run:
+        return "No se encontró corrida oficial de OR."
+
+    or_run_id = or_run["id"]
+
+    # Resolve period range: explicit ("segundo semestre 2026") or next N
+    period_range = _parse_period_range(text)
+    if period_range:
+        periods = period_range
+        period_label = f"{periods[0]} a {periods[-1]}"
+    else:
+        periods = _next_n_periods(sb, or_run_id, n=3)
+        period_label = f"próximos 3 periodos ({', '.join(periods)})"
+
+    # Resolve scenario
+    scen_match = re.search(r"\b(LOW|MEDIUM|HIGH|BAJO|MEDIO|ALTO)\b", text, re.IGNORECASE)
+    scenario = (
+        _SCENARIO_MAP.get(scen_match.group(1).upper(), scen_match.group(1).upper())
+        if scen_match else "MEDIUM"
+    )
+
+    rows = (
+        sb.table("simulation_results")
+        .select("or_code,period,pb_scenario,cu")
+        .eq("run_id", or_run_id)
+        .eq("tension_level", 2)
+        .eq("rate_type", "USER")
+        .eq("pb_scenario", scenario)
+        .in_("or_code", list(_OR_CODE_TO_BIA_MARKET.keys()))
+        .in_("period", periods)
+        .order("period").order("or_code")
+        .limit(500)
+        .execute()
+        .data or []
+    )
+
+    if not rows:
+        return f"No hay datos OR para {period_label}, escenario {scenario}."
+
+    # Group by or_code
+    or_cus: dict = defaultdict(list)
+    for r in rows:
+        if r.get("cu") is not None:
+            or_cus[r["or_code"]].append(float(r["cu"]))
+
+    if not or_cus:
+        return f"Sin datos CU de OR para {period_label}, escenario {scenario}."
+
+    summary = []
+    for or_code, cus in or_cus.items():
+        market = _OR_CODE_TO_BIA_MARKET.get(or_code, "?")
+        summary.append((or_code, market, round(sum(cus)/len(cus), 2), round(min(cus), 2), round(max(cus), 2)))
+
+    summary.sort(key=lambda x: x[2])  # cheapest first
+
+    lines = [
+        f"=== Ranking OR por CU — {period_label} | Escenario: {scenario} ===",
+        f"Corrida OR: #{or_run_id} | base {or_run.get('base_period')} | oficial: {'sí' if or_run.get('is_official') else 'no'}",
+        f"(tension_level=2, rate_type=USER | periodos: {', '.join(periods)})",
+        "",
+        f"{'#':<3} {'OR':<16} {'Mercado':<16} {'CU_avg':>8} {'CU_min':>8} {'CU_max':>8}",
+        "-" * 65,
+    ]
+    for rank, (or_code, market, avg_cu, min_cu, max_cu) in enumerate(summary, 1):
+        lines.append(f"  {rank:<3} {or_code:<14} {market:<16} {avg_cu:>8} {min_cu:>8} {max_cu:>8}")
+
+    log.info("OR RANKING | or_run=%s periods=%s scenario=%s ors=%d", or_run_id, periods, scenario, len(summary))
+    return "\n".join(lines)
 
 
 def _ctx_spread_or(text: str, or_code: str) -> str:
@@ -1311,10 +1395,11 @@ def _ctx_cu_compare(run_a: dict, run_b: dict) -> str:
 
 def build_context(user_text: str) -> str:
     """Route to the right data sources based on the question's intent."""
-    want_cu     = bool(_CU_KEYWORDS.search(user_text))
-    want_spread = bool(_SPREAD_KEYWORDS.search(user_text))
-    want_runs   = bool(_RUNS_KEYWORDS.search(user_text))
-    want_tandem = bool(_TANDEM_KEYWORDS.search(user_text))
+    want_cu         = bool(_CU_KEYWORDS.search(user_text))
+    want_spread     = bool(_SPREAD_KEYWORDS.search(user_text))
+    want_runs       = bool(_RUNS_KEYWORDS.search(user_text))
+    want_tandem     = bool(_TANDEM_KEYWORDS.search(user_text))
+    want_or_ranking = bool(_OR_RANKING_KEYWORDS.search(user_text))
 
     if not any([want_cu, want_spread, want_runs, want_tandem]):
         want_runs = True
@@ -1360,7 +1445,9 @@ def build_context(user_text: str) -> str:
     elif want_cu:
         sections.append(_ctx_cu_components(user_text))
 
-    if want_spread:
+    if want_or_ranking:
+        sections.append(_ctx_or_ranking_by_period(user_text))
+    elif want_spread:
         sections.append(_ctx_spread(user_text))
     if want_tandem:
         sections.append(_ctx_tandem(user_text))
