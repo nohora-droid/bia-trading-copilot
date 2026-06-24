@@ -278,9 +278,15 @@ _CU_KEYWORDS = re.compile(
     re.IGNORECASE,
 )
 _SPREAD_KEYWORDS = re.compile(
-    r"\b(spread|competidor|competencia|competitiv|rival|vs\b|versus|comparar|diferencia|"
+    r"\b(spread|competidor|competencia|competitiv\w*|rival|vs\b|versus|comparar|diferencia|ventaja|"
     r"epm|emcali|afinia|codensa|ebsa|chec|essa|eep|electrohuila|emsa|cedenar|cens|edeq|enerca|cetsa)\b"
     r"|celsia\s+(tolima|valle)|enel\s+(bogot[aá]|or\b)|caribe\s+sol",
+    re.IGNORECASE,
+)
+# Detect questions about trends / full period horizons
+_TREND_KEYWORDS = re.compile(
+    r"\b(tendencia|variaci[oó]n\w*|evoluci[oó]n|todos los (meses|periodos)|horizonte|"
+    r"a lo largo|semestre|trimestre|cuatrimestre|meses disponibles|pr[oó]ximos \d+ meses)\b",
     re.IGNORECASE,
 )
 _RUNS_KEYWORDS = re.compile(
@@ -501,6 +507,46 @@ def _ctx_simulation_runs(text: str) -> str:
     return "\n".join(lines)
 
 
+# ── Period range parsing (Fix 2) ─────────────────────────────────────────────
+
+_PERIOD_RANGE_RE = re.compile(
+    r"\b(primer[ao]?|segundo[ao]?|tercer[ao]?|cuarto[ao]?|"
+    r"1\s*[ero.]*|2\s*[do.]*|3\s*[ero.]*|4\s*[to.]*)"
+    r"\s+(semestre|trimestre|cuatrimestre)\s+(?:de\s+)?(\d{4})\b",
+    re.IGNORECASE,
+)
+_ORDINAL_IDX = {
+    "primer": 0, "primera": 0, "primero": 0,
+    "segundo": 1, "segunda": 1,
+    "tercer": 2, "tercera": 2, "tercero": 2,
+    "cuarto": 3, "cuarta": 3,
+    "1": 0, "2": 1, "3": 2, "4": 3,
+}
+_PERIOD_BLOCKS = {
+    "semestre":     [(1, 6),  (7, 12)],
+    "trimestre":    [(1, 3),  (4, 6),  (7, 9),  (10, 12)],
+    "cuatrimestre": [(1, 4),  (5, 8),  (9, 12)],
+}
+
+
+def _parse_period_range(text: str) -> list[str]:
+    """Parse 'segundo semestre 2026' → ['07-2026',...,'12-2026'], etc."""
+    m = _PERIOD_RANGE_RE.search(text)
+    if not m:
+        return []
+    raw = re.sub(r"[^a-z]", "", m.group(1).lower())
+    idx = _ORDINAL_IDX.get(raw)
+    if idx is None:
+        return []
+    period_type = m.group(2).lower()
+    year = m.group(3)
+    blocks = _PERIOD_BLOCKS.get(period_type, [])
+    if idx >= len(blocks):
+        return []
+    start, end = blocks[idx]
+    return [f"{str(mn).zfill(2)}-{year}" for mn in range(start, end + 1)]
+
+
 def _parse_period(text: str) -> str | None:
     m = re.search(r"\b(\d{2})[-/](\d{4})\b", text)
     if m:
@@ -583,9 +629,18 @@ def _ctx_cu_components(text: str) -> str:
         scenarios_to_fetch = available
 
     # ── Resolve periods to show ───────────────────────────────────────────────
+    wants_trend  = bool(_TREND_KEYWORDS.search(text))
+    period_range = _parse_period_range(text)
+
     if period_asked:
         periods_to_fetch = [period_asked]
         period_label = f"period={period_asked}"
+    elif period_range:
+        periods_to_fetch = period_range
+        period_label = f"periodos={', '.join(period_range)}"
+    elif wants_trend:
+        periods_to_fetch = _next_n_periods(sb, base_period, agent_code, n=12)
+        period_label = f"todos los periodos disponibles ({', '.join(periods_to_fetch)})"
     else:
         periods_to_fetch = _next_n_periods(sb, base_period, agent_code, n=3)
         period_label = f"proximos 3 periodos ({', '.join(periods_to_fetch)})"
@@ -787,6 +842,102 @@ def _ctx_spread_or(text: str, or_code: str) -> str:
     return "\n".join(lines)
 
 
+def _ctx_spread_or_all(text: str) -> str:
+    """Spread BIA vs ALL OR operators across all markets — summary view."""
+    sb = get_supabase()
+
+    bia_run = _resolve_run(text, "BIA")
+    if not bia_run:
+        return "No se encontró corrida oficial de BIA."
+    or_run = _resolve_run(text, "OR")
+    if not or_run:
+        return "No se encontró corrida oficial de OR."
+
+    bia_run_id = bia_run["id"]
+    or_run_id  = or_run["id"]
+
+    # Fetch BIA results — all markets, tension_level=2, USER, MEDIUM scenario only (keep context small)
+    bia_rows = (
+        sb.table("simulation_results")
+        .select("market,period,pb_scenario,cu")
+        .eq("run_id", bia_run_id)
+        .eq("tension_level", 2)
+        .eq("rate_type", "USER")
+        .eq("pb_scenario", "MEDIUM")
+        .order("period").order("market")
+        .limit(500)
+        .execute()
+        .data or []
+    )
+
+    # Fetch OR results — all or_codes we track, same filters
+    or_rows = (
+        sb.table("simulation_results")
+        .select("or_code,market,period,pb_scenario,cu")
+        .eq("run_id", or_run_id)
+        .in_("or_code", list(_OR_CODE_TO_BIA_MARKET.keys()))
+        .eq("tension_level", 2)
+        .eq("rate_type", "USER")
+        .eq("pb_scenario", "MEDIUM")
+        .order("period").order("or_code")
+        .limit(500)
+        .execute()
+        .data or []
+    )
+
+    if not bia_rows:
+        return f"No hay datos BIA en corrida #{bia_run_id}."
+    if not or_rows:
+        return f"No hay datos OR en corrida #{or_run_id}."
+
+    # Index BIA by (market_upper, period)
+    bia_index: dict = {}
+    for r in bia_rows:
+        key = (_normalize_market(r.get("market", "")), r["period"])
+        bia_index[key] = float(r["cu"] or 0)
+
+    # Index OR by (or_code, period)
+    or_index: dict = defaultdict(dict)
+    for r in or_rows:
+        or_index[r["or_code"]][r["period"]] = float(r["cu"] or 0)
+
+    lines = [
+        f"=== Spread BIA vs OR — todos los mercados (MEDIUM, tension_level=2, rate_type=USER) ===",
+        f"Corrida BIA: #{bia_run_id} | base {bia_run.get('base_period')} | {bia_run.get('triggered_by')} | oficial: {'sí' if bia_run.get('is_official') else 'no'}",
+        f"Corrida OR:  #{or_run_id} | base {or_run.get('base_period')} | oficial: {'sí' if or_run.get('is_official') else 'no'}",
+        "",
+    ]
+
+    # For each OR code, compute average spread across all periods where both have data
+    summary_rows: list[tuple[str, str, float, float, float]] = []  # (or_code, market, avg_spread, min_spread, max_spread)
+    for or_code, bia_market in _OR_CODE_TO_BIA_MARKET.items():
+        or_periods = or_index.get(or_code, {})
+        if not or_periods:
+            continue
+        spreads = []
+        for period, or_cu in or_periods.items():
+            bia_cu = bia_index.get((_normalize_market(bia_market), period))
+            if bia_cu:
+                spreads.append(round(bia_cu - or_cu, 2))
+        if not spreads:
+            continue
+        avg_s = round(sum(spreads) / len(spreads), 2)
+        summary_rows.append((or_code, bia_market, avg_s, min(spreads), max(spreads)))
+
+    # Sort: most favorable for BIA first (most negative = BIA cheapest vs OR)
+    summary_rows.sort(key=lambda x: x[2])
+
+    lines.append(f"{'OR':<16} {'Mercado BIA':<16} {'Spread avg':>11} {'Min':>9} {'Max':>9} {'Posición'}")
+    lines.append("-" * 75)
+    for or_code, bia_market, avg_s, min_s, max_s in summary_rows:
+        sign = f"+{avg_s}" if avg_s > 0 else str(avg_s)
+        posicion = "🟢 BIA más barato" if avg_s < 0 else "🔴 BIA más caro"
+        lines.append(f"  {or_code:<14} {bia_market:<16} {sign:>11} {min_s:>9} {max_s:>9}   {posicion}")
+
+    log.info("SPREAD OR ALL | bia_run=%s or_run=%s markets=%d", bia_run_id, or_run_id, len(summary_rows))
+    return "\n".join(lines)
+
+
 def _ctx_spread(text: str) -> str:
     sb = get_supabase()
     text_l = text.lower()
@@ -804,6 +955,18 @@ def _ctx_spread(text: str) -> str:
 
     if asked_or:
         return _ctx_spread_or(text, asked_or)
+
+    # Generic OR query ("frente a los OR", "vs OR", "competitivo frente a OR") → all markets
+    asks_or_generic = bool(re.search(
+        r"\b(frente a.*\bor\b|\bor\b.*mercado|vs.*\bor\b|\bor\b.*competitiv|competitiv.*\bor\b|"
+        r"posici[oó]n.*\bor\b|\bor\b.*posici[oó]n|m[aá]s competitiv.*\bor\b)\b",
+        text_l,
+    ))
+    if not asks_or_generic:
+        # Simpler: "OR" appears and no specific OR alias was matched
+        asks_or_generic = bool(re.search(r"\bor\b", text_l)) and "or_code" not in text_l
+    if asks_or_generic:
+        return _ctx_spread_or_all(text)
 
     # ── Comercializadores path (existing view) ────────────────────────────────
     # Detect market mention in the question and build filter candidates
