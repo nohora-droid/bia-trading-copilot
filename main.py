@@ -560,12 +560,11 @@ def _parse_period(text: str) -> str | None:
     return None
 
 
-def _next_n_periods(sb, base_period: str, agent_code: str, n: int = 3) -> list[str]:
+def _next_n_periods(sb, run_id: int, n: int = 3) -> list[str]:
     rows = (
         sb.table("simulation_results")
         .select("period")
-        .eq("base_period", base_period)
-        .eq("agent_code", agent_code)
+        .eq("run_id", run_id)
         .limit(2000)
         .execute()
         .data or []
@@ -600,11 +599,12 @@ def _ctx_cu_components(text: str) -> str:
     run_trace   = _fmt_run(run)
 
     # ── Discover available pb_scenario ───────────────────────────────────────
+    # Filter by run_id (not base_period) to avoid picking up rows from other runs
+    run_id = run["id"]
     avail_rows = (
         sb.table("simulation_results")
         .select("pb_scenario")
-        .eq("base_period", base_period)
-        .eq("agent_code", agent_code)
+        .eq("run_id", run_id)
         .limit(2000)
         .execute()
         .data or []
@@ -639,26 +639,27 @@ def _ctx_cu_components(text: str) -> str:
         periods_to_fetch = period_range
         period_label = f"periodos={', '.join(period_range)}"
     elif wants_trend:
-        periods_to_fetch = _next_n_periods(sb, base_period, agent_code, n=12)
+        periods_to_fetch = _next_n_periods(sb, run_id, n=12)
         period_label = f"todos los periodos disponibles ({', '.join(periods_to_fetch)})"
     else:
-        periods_to_fetch = _next_n_periods(sb, base_period, agent_code, n=3)
+        periods_to_fetch = _next_n_periods(sb, run_id, n=3)
         period_label = f"proximos 3 periodos ({', '.join(periods_to_fetch)})"
 
-    # ── Main data query (tension_level=2, rate_type=USER as canonical slice) ──
+    # ── Main data query — scoped to run_id to avoid cross-run contamination ──
     query = (
         sb.table("simulation_results")
         .select(
             "agent_code,base_period,market,period,pb_scenario,"
             "cu,g,c,t,d,p,r,g_base,g_transitorio,aj,alpha"
         )
-        .eq("base_period", base_period)
-        .eq("agent_code", agent_code)
+        .eq("run_id", run_id)
         .eq("tension_level", 2)
         .eq("rate_type", "USER")
         .in_("pb_scenario", scenarios_to_fetch)
-        .in_("period", periods_to_fetch)
     )
+    # For trend queries skip the period filter — we want all periods for trend analysis.
+    if not wants_trend:
+        query = query.in_("period", periods_to_fetch)
     if market_filter:
         query = query.ilike("market", f"%{market_filter}%")
 
@@ -687,16 +688,46 @@ def _ctx_cu_components(text: str) -> str:
         f"Escenarios disponibles: {', '.join(available)} | Mostrando: {', '.join(scenarios_to_fetch)}",
         f"(tension_level=2, rate_type=USER | {len(groups)} combinaciones)",
     ]
-    for (market, period, scenario), entries in list(groups.items())[:90]:
-        def avg(col: str) -> float:
-            return round(sum(e[col] or 0 for e in entries) / len(entries), 2)
-        lines.append(
-            f"  {market} | {period} | {scenario}: "
-            f"CU={avg('cu')} G={avg('g')} C={avg('c')} "
-            f"T={avg('t')} D={avg('d')} P={avg('p')} R={avg('r')}"
-        )
-    if len(groups) > 90:
-        lines.append(f"  ... y {len(groups) - 90} combinaciones mas.")
+
+    if wants_trend and not market_filter:
+        # Compact trend view: G (and CU) per period × scenario, averaged across all markets.
+        # Replaces the per-market detail entirely — avoids [:90] truncation hiding later periods.
+        period_scen: dict = defaultdict(list)
+        for r in rows:
+            period_scen[(r["period"], r["pb_scenario"])].append(r)
+
+        # Sort chronologically: periods are MM-YYYY; sort by (year, month)
+        def _period_sort_key(ps):
+            p = ps[0]
+            parts = p.split("-")
+            return (int(parts[1]), int(parts[0]))
+
+        lines.append("--- Tendencia G y CU — promedio de todos los mercados por periodo ---")
+        lines.append(f"{'Periodo':<10} {'Escenario':<8} {'G_avg':>8} {'CU_avg':>8} {'G_min':>8} {'G_max':>8}")
+        lines.append("-" * 58)
+        for (period, scenario) in sorted(period_scen.keys(), key=_period_sort_key):
+            entries = period_scen[(period, scenario)]
+            g_vals  = [float(e["g"]  or 0) for e in entries if e.get("g")  is not None]
+            cu_vals = [float(e["cu"] or 0) for e in entries if e.get("cu") is not None]
+            if not g_vals:
+                continue
+            g_avg  = round(sum(g_vals)  / len(g_vals),  2)
+            cu_avg = round(sum(cu_vals) / len(cu_vals), 2) if cu_vals else 0
+            g_min  = round(min(g_vals), 2)
+            g_max  = round(max(g_vals), 2)
+            lines.append(f"  {period:<10} {scenario:<8} {g_avg:>8} {cu_avg:>8} {g_min:>8} {g_max:>8}")
+        lines.append(f"  (basado en {len(rows)} registros | {len({r['market'] for r in rows})} mercados)")
+    else:
+        for (market, period, scenario), entries in list(groups.items())[:90]:
+            def avg(col: str) -> float:
+                return round(sum(e[col] or 0 for e in entries) / len(entries), 2)
+            lines.append(
+                f"  {market} | {period} | {scenario}: "
+                f"CU={avg('cu')} G={avg('g')} C={avg('c')} "
+                f"T={avg('t')} D={avg('d')} P={avg('p')} R={avg('r')}"
+            )
+        if len(groups) > 90:
+            lines.append(f"  ... y {len(groups) - 90} combinaciones mas.")
     return "\n".join(lines)
 
 
@@ -1371,32 +1402,57 @@ async def handle_mention(event: dict) -> None:
 
 # ── Endpoints ─────────────────────────────────────────────────────────────────
 
+async def _process_event(body: dict) -> None:
+    """
+    Runs in a background task — called AFTER the 200 has already been sent.
+    Deduplicates via INSERT (unique PK): if the row already exists Supabase
+    raises a unique-violation and we bail out silently.
+    """
+    event = body.get("event", {})
+    if event.get("type") != "app_mention":
+        return
+
+    event_ts = event.get("event_ts") or event.get("ts", "")
+    if not event_ts:
+        log.warning("PROCESS EVENT: no event_ts, skipping")
+        return
+
+    sb = get_supabase()
+    try:
+        result = (
+            sb.table("processed_events")
+            .upsert({"event_ts": event_ts}, on_conflict="event_ts", ignore_duplicates=True)
+            .execute()
+        )
+        if not result.data:
+            log.warning("DUPLICATE BLOCKED | event_ts=%s", event_ts)
+            return
+        log.info("DEDUP OK | event_ts=%s", event_ts)
+        # Cleanup old records (best-effort)
+        try:
+            cutoff = (datetime.now(timezone.utc) - timedelta(hours=1)).isoformat()
+            sb.table("processed_events").delete().lt("processed_at", cutoff).execute()
+        except Exception:
+            pass
+    except Exception as e:
+        log.error("DEDUP ERROR | event_ts=%s err=%.200s", event_ts, e)
+        return  # Don't process if we can't deduplicate
+
+    await handle_mention(event)
+
+
 @app.post("/slack/events")
 async def slack_events(request: Request, background_tasks: BackgroundTasks):
-    t0 = datetime.now(timezone.utc)
     body = await request.json()
 
-    # URL verification challenge
+    # URL verification — must respond synchronously with the challenge value
     if body.get("type") == "url_verification":
-        log.info("SLACK challenge received — responding immediately")
-        return JSONResponse({"challenge": body["challenge"]})
+        log.info("SLACK challenge received")
+        return JSONResponse({"challenge": body.get("challenge")})
 
-    event    = body.get("event", {})
-    event_ts = event.get("event_ts") or event.get("ts", "")
-
-    log.info("SLACK event received | type=%s event_ts=%s t=%s",
-             event.get("type"), event_ts, t0.isoformat())
-
-    if event.get("type") == "app_mention":
-        # Claim atomically via Supabase PK — distributed mutex across all instances
-        if event_ts and _is_duplicate(event_ts):
-            return Response(status_code=200)
-
-        log.info("PROCESSING: %s", event_ts)
-        background_tasks.add_task(handle_mention, event)
-
-    elapsed = (datetime.now(timezone.utc) - t0).total_seconds()
-    log.info("SLACK 200 sent | event_ts=%s elapsed=%.3fs", event_ts, elapsed)
+    # Respond 200 IMMEDIATELY — Slack requires a response within 3 seconds.
+    # All deduplication and processing happen in the background task.
+    background_tasks.add_task(_process_event, body)
     return Response(status_code=200)
 
 
