@@ -758,7 +758,7 @@ _OR_COMP_ALIASES: dict[str, list[str]] = {
     "ENEL":          ["enel bogota", "enel bogotá", "codensa", "enel or"],
     "EMCALI":        ["emcali"],
     "AFINIA":        ["afinia"],
-    "AIRE":          ["aire caribe", "caribe sol"],
+    "AIRE":          ["air-e", "aire caribe", "caribe sol", "aire"],
     "CELSIA TOLIMA": ["celsia tolima"],
     "CELSIA VALLE":  ["celsia valle"],
     "EBSA":          ["ebsa"],
@@ -825,11 +825,13 @@ def _ctx_or_ranking_by_period(text: str) -> str:
         if scen_match else "MEDIUM"
     )
 
+    tension_level = _parse_tension_level(text)
+
     rows = (
         sb.table("simulation_results")
         .select("or_code,period,pb_scenario,cu")
         .eq("run_id", or_run_id)
-        .eq("tension_level", 2)
+        .eq("tension_level", tension_level)
         .eq("rate_type", "USER")
         .eq("pb_scenario", scenario)
         .in_("or_code", list(_OR_CODE_TO_BIA_MARKET.keys()))
@@ -841,7 +843,7 @@ def _ctx_or_ranking_by_period(text: str) -> str:
     )
 
     if not rows:
-        return f"No hay datos OR para {period_label}, escenario {scenario}."
+        return f"No hay datos OR para {period_label}, escenario {scenario}, tension_level={tension_level}."
 
     # Group by or_code
     or_cus: dict = defaultdict(list)
@@ -862,7 +864,7 @@ def _ctx_or_ranking_by_period(text: str) -> str:
     lines = [
         f"=== Ranking OR por CU — {period_label} | Escenario: {scenario} ===",
         f"Corrida OR: #{or_run_id} | base {or_run.get('base_period')} | oficial: {'sí' if or_run.get('is_official') else 'no'}",
-        f"(tension_level=2, rate_type=USER | periodos: {', '.join(periods)})",
+        f"(tension_level={tension_level}, rate_type=USER | periodos: {', '.join(periods)})",
         "",
         f"{'#':<3} {'OR':<16} {'Mercado':<16} {'CU_avg':>8} {'CU_min':>8} {'CU_max':>8}",
         "-" * 65,
@@ -874,27 +876,54 @@ def _ctx_or_ranking_by_period(text: str) -> str:
     return "\n".join(lines)
 
 
-def _ctx_spread_or(text: str, or_code: str) -> str:
-    """Compute spread BIA vs an OR operator directly from simulation_results."""
-    sb = get_supabase()
+def _parse_tension_level(text: str) -> int:
+    """Parse tension level from text. Defaults to 2 (T2/media tensión)."""
+    m = re.search(
+        r"\b(t[123]\b|tension\s*[123]|tensi[oó]n\s*[123]|nivel\s*[123]|"
+        r"alta\s+tensi[oó]n|media\s+tensi[oó]n|baja\s+tensi[oó]n)\b",
+        text, re.IGNORECASE,
+    )
+    if not m:
+        return 2
+    raw = m.group(0).lower()
+    if any(x in raw for x in ["t1", "tension 1", "tensión 1", "nivel 1", "baja"]):
+        return 1
+    if any(x in raw for x in ["t3", "tension 3", "tensión 3", "nivel 3", "alta"]):
+        return 3
+    return 2
 
-    bia_run = _resolve_run(text, "BIA")
-    if not bia_run:
-        return "No se encontró corrida oficial de BIA."
-    or_run = _resolve_run(text, "OR")
-    if not or_run:
-        return "No se encontró corrida oficial de OR."
 
+def _extract_or_codes(text: str) -> list[str]:
+    """Return ALL OR codes explicitly mentioned in text, in order of appearance."""
+    text_l = text.lower()
+    found: list[str] = []
+    seen: set[str] = set()
+    # Scan in alias order so longer aliases win (e.g. "celsia tolima" before "celsia")
+    for code, aliases in _OR_COMP_ALIASES.items():
+        for alias in aliases:
+            if alias in text_l and code not in seen:
+                found.append(code)
+                seen.add(code)
+                break
+    # "enel" alone (not "enel x") → OR
+    if "ENEL" not in seen and "enel" in text_l and "enel x" not in text_l:
+        found.append("ENEL")
+    return found
+
+
+def _ctx_spread_or_one(
+    sb, bia_run: dict, or_run: dict, or_code: str, tension_level: int
+) -> str:
+    """Build spread block for a single OR code. Shared by single and multi-OR paths."""
     bia_market = _OR_CODE_TO_BIA_MARKET.get(or_code)
     bia_run_id = bia_run["id"]
     or_run_id  = or_run["id"]
 
-    # BIA rows for the relevant market
     bia_q = (
         sb.table("simulation_results")
         .select("market,period,pb_scenario,cu,g,t,d,c,p,r")
         .eq("run_id", bia_run_id)
-        .eq("tension_level", 2)
+        .eq("tension_level", tension_level)
         .eq("rate_type", "USER")
         .order("period").order("pb_scenario")
         .limit(200)
@@ -903,13 +932,12 @@ def _ctx_spread_or(text: str, or_code: str) -> str:
         bia_q = bia_q.ilike("market", f"%{bia_market}%")
     bia_rows = bia_q.execute().data or []
 
-    # OR rows for this or_code
     or_rows = (
         sb.table("simulation_results")
         .select("or_code,period,pb_scenario,cu")
         .eq("run_id", or_run_id)
         .eq("or_code", or_code)
-        .eq("tension_level", 2)
+        .eq("tension_level", tension_level)
         .eq("rate_type", "USER")
         .order("period").order("pb_scenario")
         .limit(200)
@@ -918,29 +946,22 @@ def _ctx_spread_or(text: str, or_code: str) -> str:
     )
 
     if not bia_rows:
-        return f"No hay datos BIA para el mercado de {or_code} ({bia_market})."
+        return f"  [Sin datos BIA para {or_code} ({bia_market}) | tension_level={tension_level}]"
     if not or_rows:
-        return f"No hay datos OR para or_code={or_code} en la corrida OR #{or_run_id}."
+        return f"  [Sin datos OR para or_code={or_code} | tension_level={tension_level}]"
 
-    # Index OR by (period, scenario)
     or_index: dict = {}
     for r in or_rows:
         or_index[(r["period"], r["pb_scenario"])] = float(r["cu"] or 0)
 
-    # Index BIA by (market, period, scenario) → avg cu
-    from collections import defaultdict
     bia_groups: dict = defaultdict(list)
     for r in bia_rows:
         bia_groups[(r["market"], r["period"], r["pb_scenario"])].append(float(r["cu"] or 0))
 
     lines = [
-        f"=== Spread BIA vs {or_code} (OR) ===",
-        f"Corrida BIA: #{bia_run_id} | base {bia_run.get('base_period')} | {bia_run.get('triggered_by')} | oficial: {'sí' if bia_run.get('is_official') else 'no'}",
-        f"Corrida OR:  #{or_run_id} | base {or_run.get('base_period')} | oficial: {'sí' if or_run.get('is_official') else 'no'}",
-        f"Nota: {or_code} es un Operador de Red (OR) — competidor de BIA en su mercado ({bia_market or 'varios'})",
-        "(tension_level=2, rate_type=USER)",
+        f"=== Spread BIA vs {or_code} (OR) | tension_level={tension_level} ===",
+        f"  Mercado BIA: {bia_market or 'todos'}",
     ]
-
     for (market, period, scenario), bia_cus in sorted(bia_groups.items()):
         bia_cu = round(sum(bia_cus) / len(bia_cus), 2)
         or_cu  = or_index.get((period, scenario))
@@ -953,8 +974,39 @@ def _ctx_spread_or(text: str, or_code: str) -> str:
         else:
             lines.append(f"  {market} | {period} | {scenario}: BIA={bia_cu}  {or_code}=sin dato")
 
-    log.info("SPREAD OR | or_code=%s bia_rows=%d or_rows=%d", or_code, len(bia_rows), len(or_rows))
+    log.info("SPREAD OR | or_code=%s tension=%d bia_rows=%d or_rows=%d",
+             or_code, tension_level, len(bia_rows), len(or_rows))
     return "\n".join(lines)
+
+
+def _ctx_spread_or(text: str, or_codes: list[str]) -> str:
+    """Compute spread BIA vs one or more OR operators. Iterates all requested OR codes."""
+    sb = get_supabase()
+
+    bia_run = _resolve_run(text, "BIA")
+    if not bia_run:
+        return "No se encontró corrida oficial de BIA."
+    or_run = _resolve_run(text, "OR")
+    if not or_run:
+        return "No se encontró corrida oficial de OR."
+
+    tension_level = _parse_tension_level(text)
+
+    header = [
+        f"Corrida BIA: #{bia_run['id']} | base {bia_run.get('base_period')} | "
+        f"{bia_run.get('triggered_by')} | oficial: {'sí' if bia_run.get('is_official') else 'no'}",
+        f"Corrida OR:  #{or_run['id']} | base {or_run.get('base_period')} | "
+        f"oficial: {'sí' if or_run.get('is_official') else 'no'}",
+        f"Nota: OR como Operadores de Red (competidores de BIA en sus mercados)",
+        f"(tension_level={tension_level}, rate_type=USER)",
+        "",
+    ]
+
+    blocks = ["\n".join(header)]
+    for code in or_codes:
+        blocks.append(_ctx_spread_or_one(sb, bia_run, or_run, code, tension_level))
+
+    return "\n\n".join(blocks)
 
 
 def _ctx_spread_or_all(text: str) -> str:
@@ -1057,19 +1109,11 @@ def _ctx_spread(text: str) -> str:
     sb = get_supabase()
     text_l = text.lower()
 
-    # Check if the user is asking about an OR operator specifically
-    asked_or = next(
-        (code for code, aliases in _OR_COMP_ALIASES.items()
-         if any(a in text_l for a in aliases)),
-        None,
-    )
-    # "enel" alone (without "x" or "bogotá") is ambiguous — prefer OR interpretation
-    # since EXEC aliases use "enel x" explicitly; bare "enel" = OR operator
-    if not asked_or and "enel" in text_l and "enel x" not in text_l:
-        asked_or = "ENEL"
+    # Extract ALL OR codes mentioned — supports multi-OR questions
+    asked_ors = _extract_or_codes(text_l)
 
-    if asked_or:
-        return _ctx_spread_or(text, asked_or)
+    if asked_ors:
+        return _ctx_spread_or(text, asked_ors)
 
     # Generic OR query ("frente a los OR", "vs OR", "competitivo frente a OR") → all markets
     asks_or_generic = bool(re.search(
