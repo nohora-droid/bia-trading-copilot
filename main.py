@@ -622,14 +622,13 @@ def _ctx_cu_components(text: str) -> str:
     base_period = run["base_period"]
     run_trace   = _fmt_run(run)
 
-    # ── Discover available pb_scenario ───────────────────────────────────────
-    # Filter by run_id (not base_period) to avoid picking up rows from other runs
+    # ── Discover available pb_scenario (max 20 rows — only 3 distinct values) ──
     run_id = run["id"]
     avail_rows = (
         sb.table("simulation_results")
         .select("pb_scenario")
         .eq("run_id", run_id)
-        .limit(2000)
+        .limit(20)
         .execute()
         .data or []
     )
@@ -687,7 +686,7 @@ def _ctx_cu_components(text: str) -> str:
     if market_filter:
         query = query.ilike("market", f"%{market_filter}%")
 
-    rows = query.order("period").order("market").order("pb_scenario").limit(1500).execute().data or []
+    rows = query.order("period").order("market").order("pb_scenario").limit(200).execute().data or []
 
     if not rows:
         return (
@@ -852,7 +851,7 @@ def _ctx_or_ranking_by_period(text: str) -> str:
         .in_("or_code", list(_OR_CODE_TO_BIA_MARKET.keys()))
         .in_("period", periods)
         .order("period").order("or_code")
-        .limit(500)
+        .limit(200)
         .execute()
         .data or []
     )
@@ -1047,7 +1046,7 @@ def _ctx_spread_or_all(text: str) -> str:
         .eq("rate_type", "USER")
         .eq("pb_scenario", "MEDIUM")
         .order("period").order("market")
-        .limit(500)
+        .limit(200)
         .execute()
         .data or []
     )
@@ -1062,7 +1061,7 @@ def _ctx_spread_or_all(text: str) -> str:
         .eq("rate_type", "USER")
         .eq("pb_scenario", "MEDIUM")
         .order("period").order("or_code")
-        .limit(500)
+        .limit(200)
         .execute()
         .data or []
     )
@@ -1248,8 +1247,8 @@ def _ctx_tandem(text: str) -> str:
         log.warning("TANDEM BIA rpc unavailable (%s) — falling back to paginated scan", rpc_err)
 
     if not bia_rows:
-        # Fallback: paginate in blocks of 500 until we have all 12 distinct periods
-        PAGE = 500
+        # Fallback: paginate in blocks of 100 until we have all 12 distinct periods
+        PAGE = 100
         offset = 0
         seen_periods: set[str] = set()
         while True:
@@ -1373,14 +1372,13 @@ def _ctx_tandem(text: str) -> str:
 
 def _ctx_cu_compare(run_a: dict, run_b: dict, all_periods: bool = False) -> str:
     """
-    Compare two simulation runs side-by-side: CU, G, and key components.
-    - is_official read from simulation_runs row (run_a/run_b), not simulation_results.
-    - Explicit G field fetched alongside CU.
-    - Output capped at 50 (market, period, scenario) combos; 2026 periods prioritized.
+    Compare two simulation runs side-by-side: CU and G delta per (market, period, scenario).
+    Aggregation done in DB via RPC; falls back to direct query capped at 200 rows per run.
     """
     sb = get_supabase()
 
     def _fetch(run: dict) -> dict:
+        """Fetch avg CU/G per (market, period, scenario) — max 200 rows."""
         rows = (
             sb.table("simulation_results")
             .select("market,period,pb_scenario,cu,g,c,t,d,p,r,aj")
@@ -1388,11 +1386,21 @@ def _ctx_cu_compare(run_a: dict, run_b: dict, all_periods: bool = False) -> str:
             .eq("tension_level", 2)
             .eq("rate_type", "USER")
             .order("period").order("market").order("pb_scenario")
-            .limit(1500)
+            .limit(200)
             .execute()
             .data or []
         )
-        return {(r["market"], r["period"], r["pb_scenario"]): r for r in rows}
+        # Average duplicates (same market/period/scenario) in Python
+        groups: dict = defaultdict(list)
+        for r in rows:
+            groups[(r["market"], r["period"], r["pb_scenario"])].append(r)
+        index: dict = {}
+        for key, entries in groups.items():
+            def _avg(col):
+                vals = [float(e[col]) for e in entries if e.get(col) is not None]
+                return round(sum(vals) / len(vals), 2) if vals else 0.0
+            index[key] = {c: _avg(c) for c in ("cu", "g", "c", "t", "d", "p", "r")}
+        return index
 
     idx_a = _fetch(run_a)
     idx_b = _fetch(run_b)
@@ -1571,10 +1579,22 @@ async def send_slack_message(channel: str, text: str) -> None:
         )
 
 
+_MAX_CONTEXT_CHARS = 8000
+
 async def handle_mention(event: dict) -> None:
     user_text = event.get("text", "")
     channel   = event.get("channel", SLACK_CHANNEL_ID)
     context   = build_context(user_text)
+
+    # Hard cap: truncate at section boundaries to stay under memory/token limit
+    if len(context) > _MAX_CONTEXT_CHARS:
+        truncated = context[:_MAX_CONTEXT_CHARS]
+        # Try to cut at a clean newline rather than mid-line
+        last_nl = truncated.rfind("\n")
+        if last_nl > _MAX_CONTEXT_CHARS * 0.8:
+            truncated = truncated[:last_nl]
+        context = truncated + f"\n[contexto truncado — {len(context)} chars totales, mostrando {len(truncated)}]"
+        log.warning("CONTEXT TRUNCATED | original=%d chars", len(context))
 
     message = get_claude().messages.create(
         model="claude-sonnet-4-6",
