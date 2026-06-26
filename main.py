@@ -69,35 +69,50 @@ def get_claude() -> anthropic.Anthropic:
 
 def _is_duplicate(event_ts: str) -> bool:
     """
-    Returns True if this event_ts was already processed.
-    Uses upsert with ON CONFLICT DO NOTHING (ignore_duplicates=True).
-    PostgREST returns an empty data list when the row already existed,
-    and a one-element list when it was freshly inserted — that's our mutex.
-    Any infra error lets the event through so messages are never silently dropped.
+    Returns True if this event_ts was already processed OR if the DB is unavailable.
+    Two-phase check:
+      1. SELECT first — fast path for retries (row already exists → True immediately)
+      2. Upsert with ignore_duplicates — atomic insert; empty result = conflict → True
+    On ANY DB error we return True (block) to prevent triplication from Slack retries.
     """
     sb = get_supabase()
     try:
+        # Phase 1: cheap read — catches Slack retries without a write
+        exists = (
+            sb.table("processed_events")
+            .select("event_ts")
+            .eq("event_ts", event_ts)
+            .limit(1)
+            .execute()
+            .data or []
+        )
+        if exists:
+            log.warning("DUPLICATE BLOCKED (select) | event_ts=%s", event_ts)
+            return True
+
+        # Phase 2: atomic insert — winner processes, losers are blocked
         result = (
             sb.table("processed_events")
             .upsert({"event_ts": event_ts}, on_conflict="event_ts", ignore_duplicates=True)
             .execute()
         )
-        inserted = bool(result.data)  # empty list = conflict (already existed)
-        if inserted:
-            log.info("DEDUP INSERT OK | event_ts=%s", event_ts)
-            # Cleanup stale records — ignore errors
-            try:
-                cutoff = (datetime.now(timezone.utc) - timedelta(hours=1)).isoformat()
-                sb.table("processed_events").delete().lt("processed_at", cutoff).execute()
-            except Exception:
-                pass
-            return False  # new event — process it
-        else:
-            log.warning("DUPLICATE BLOCKED (upsert no-op): %s", event_ts)
-            return True  # already existed — duplicate
+        if not result.data:
+            log.warning("DUPLICATE BLOCKED (upsert) | event_ts=%s", event_ts)
+            return True
+
+        log.info("DEDUP INSERT OK | event_ts=%s", event_ts)
+        # Cleanup stale records — best-effort
+        try:
+            cutoff = (datetime.now(timezone.utc) - timedelta(hours=1)).isoformat()
+            sb.table("processed_events").delete().lt("processed_at", cutoff).execute()
+        except Exception:
+            pass
+        return False  # new event — process it
+
     except Exception as e:
-        log.error("DEDUP ERROR (letting through) | event_ts=%s err=%.200s", event_ts, e)
-        return False
+        # DB unavailable — block to prevent triplication. Slack will retry later.
+        log.error("DEDUP ERROR (blocking) | event_ts=%s err=%.200s", event_ts, e)
+        return True
 
 # ── System Prompt ─────────────────────────────────────────────────────────────
 
@@ -1356,15 +1371,15 @@ def _ctx_tandem(text: str) -> str:
     return "\n".join(lines)
 
 
-def _ctx_cu_compare(run_a: dict, run_b: dict) -> str:
+def _ctx_cu_compare(run_a: dict, run_b: dict, all_periods: bool = False) -> str:
     """
     Load CU results for two specific runs and show a side-by-side delta.
-    run_a / run_b are rows from simulation_runs.
+    all_periods=True fetches every period available; default fetches all (limit 1500).
     """
     sb = get_supabase()
 
     def _fetch_cu(run: dict) -> dict:
-        """Return {(market, period, scenario): cu} for a run."""
+        """Return {(market, period, scenario): cu} for a run — all periods."""
         rows = (
             sb.table("simulation_results")
             .select("market,period,pb_scenario,cu,g,c,t,d,p,r")
@@ -1448,44 +1463,76 @@ def build_context(user_text: str) -> str:
     if not any([want_cu, want_spread, want_runs, want_tandem]):
         want_runs = True
 
-    # Detect comparison between two named runs (e.g. "corrida de Allison y corrió Juliana")
+    # Detect comparison intent
     raw_names = re.findall(
         r"(?:corri[oó]|ejecut[oó]|corrida\s+de|la\s+de|de)\s+([a-záéíóúñ]{3,})",
         user_text.lower(),
     )
     compare_names = [n for n in dict.fromkeys(raw_names) if n not in _EXCLUDED_PERSON_WORDS]
-    is_compare = len(compare_names) >= 2
+
+    # "últimas dos corridas" / "corrida anterior" / "corrida previa" without person names
+    wants_last_two = bool(re.search(
+        r"\b([uú]ltimas?\s+(dos|2)\s+corridas?|corrida\s+(anterior|previa)|"
+        r"[uú]ltimas?\s+dos\s+corridas?|anterior\s+corrida|comparar\s+corridas?)\b",
+        user_text, re.IGNORECASE,
+    )) and not compare_names
+
+    # Fix 2: fetch all periods when question references 2026 or asks for full history
+    wants_all_periods = bool(re.search(
+        r"\b(2026|todos los periodos?|histor|completo|completa|todos los meses)\b",
+        user_text, re.IGNORECASE,
+    ))
+
+    is_compare = len(compare_names) >= 2 or wants_last_two
 
     sections: list[str] = []
     if want_runs:
         sections.append(_ctx_simulation_runs(user_text))
 
     if is_compare:
-        # Fetch the most recent BIA run per person and compare their CU directly
         sb = get_supabase()
         runs_by_name: list[dict] = []
-        for name in compare_names[:2]:
-            r = (
+
+        if wants_last_two:
+            # Auto-resolve: two most recent official BIA runs
+            official_runs = (
                 sb.table("simulation_runs")
                 .select("id,agent_code,base_period,is_official,triggered_by,created_at,status")
                 .eq("agent_code", "BIA")
                 .eq("status", "COMPLETED")
-                .ilike("triggered_by", f"%{name}%")
+                .eq("is_official", True)
                 .order("created_at", desc=True)
-                .limit(1)
+                .limit(2)
                 .execute()
                 .data or []
             )
-            if r:
-                runs_by_name.append(r[0])
+            runs_by_name = official_runs
+            log.info("COMPARE last-two | runs=%s", [r['id'] for r in runs_by_name])
+        else:
+            for name in compare_names[:2]:
+                r = (
+                    sb.table("simulation_runs")
+                    .select("id,agent_code,base_period,is_official,triggered_by,created_at,status")
+                    .eq("agent_code", "BIA")
+                    .eq("status", "COMPLETED")
+                    .ilike("triggered_by", f"%{name}%")
+                    .order("created_at", desc=True)
+                    .limit(1)
+                    .execute()
+                    .data or []
+                )
+                if r:
+                    runs_by_name.append(r[0])
+            log.info("COMPARE | names=%s runs=%s", compare_names, [r['id'] for r in runs_by_name])
+
         if len(runs_by_name) == 2:
-            sections.append(_ctx_cu_compare(runs_by_name[0], runs_by_name[1]))
+            sections.append(_ctx_cu_compare(runs_by_name[0], runs_by_name[1], all_periods=wants_all_periods))
         elif len(runs_by_name) == 1:
+            who = "corrida anterior" if wants_last_two else compare_names[1]
             sections.append(
-                f"Solo encontré corrida de {compare_names[0]} (#{runs_by_name[0]['id']}). "
-                f"No hay corrida de {compare_names[1]} en simulation_runs."
+                f"Solo encontré corrida #{runs_by_name[0]['id']}. "
+                f"No se encontró la {who} en simulation_runs."
             )
-        log.info("COMPARE | names=%s runs=%s", compare_names, [r['id'] for r in runs_by_name])
     elif want_cu:
         sections.append(_ctx_cu_components(user_text))
 
