@@ -1373,16 +1373,17 @@ def _ctx_tandem(text: str) -> str:
 
 def _ctx_cu_compare(run_a: dict, run_b: dict, all_periods: bool = False) -> str:
     """
-    Load CU results for two specific runs and show a side-by-side delta.
-    all_periods=True fetches every period available; default fetches all (limit 1500).
+    Compare two simulation runs side-by-side: CU, G, and key components.
+    - is_official read from simulation_runs row (run_a/run_b), not simulation_results.
+    - Explicit G field fetched alongside CU.
+    - Output capped at 50 (market, period, scenario) combos; 2026 periods prioritized.
     """
     sb = get_supabase()
 
-    def _fetch_cu(run: dict) -> dict:
-        """Return {(market, period, scenario): cu} for a run — all periods."""
+    def _fetch(run: dict) -> dict:
         rows = (
             sb.table("simulation_results")
-            .select("market,period,pb_scenario,cu,g,c,t,d,p,r")
+            .select("market,period,pb_scenario,cu,g,c,t,d,p,r,aj")
             .eq("run_id", run["id"])
             .eq("tension_level", 2)
             .eq("rate_type", "USER")
@@ -1391,64 +1392,77 @@ def _ctx_cu_compare(run_a: dict, run_b: dict, all_periods: bool = False) -> str:
             .execute()
             .data or []
         )
-        index: dict = {}
-        for r in rows:
-            key = (r["market"], r["period"], r["pb_scenario"])
-            index[key] = r
-        return index
+        return {(r["market"], r["period"], r["pb_scenario"]): r for r in rows}
 
-    idx_a = _fetch_cu(run_a)
-    idx_b = _fetch_cu(run_b)
+    idx_a = _fetch(run_a)
+    idx_b = _fetch(run_b)
 
-    label_a = f"#{run_a['id']} ({(run_a.get('triggered_by') or '').split('@')[0]} | base {run_a.get('base_period')})"
-    label_b = f"#{run_b['id']} ({(run_b.get('triggered_by') or '').split('@')[0]} | base {run_b.get('base_period')})"
+    # Fix 1: is_official comes from the simulation_runs row, not simulation_results
+    def _run_label(run: dict) -> str:
+        who     = (run.get("triggered_by") or "desconocido").split("@")[0]
+        oficial = "sí" if run.get("is_official") else "no"
+        return (
+            f"#{run['id']} | {run.get('agent_code')} | base {run.get('base_period')} | "
+            f"{run.get('created_at','')[:10]} | {who} | oficial: {oficial}"
+        )
 
     if not idx_a:
-        return f"=== Comparación de corridas ===\nSin datos en simulation_results para corrida {run_a['id']}."
+        return f"=== Comparación de corridas ===\nSin datos para corrida #{run_a['id']}."
     if not idx_b:
-        return f"=== Comparación de corridas ===\nSin datos en simulation_results para corrida {run_b['id']}."
+        return f"=== Comparación de corridas ===\nSin datos para corrida #{run_b['id']}."
 
-    # Only compare keys that appear in both runs
     common_keys = sorted(set(idx_a) & set(idx_b))
     if not common_keys:
         return (
             f"=== Comparación de corridas ===\n"
-            f"No hay periodos/mercados en común entre {run_a['id']} y {run_b['id']}.\n"
-            f"Corrida A tiene {len(idx_a)} combinaciones, corrida B tiene {len(idx_b)} combinaciones."
+            f"Sin combinaciones en común entre #{run_a['id']} y #{run_b['id']}.\n"
+            f"Corrida A: {len(idx_a)} filas | Corrida B: {len(idx_b)} filas."
         )
 
+    # Fix 3: cap at 50 combos, prioritizing 2026 periods when all_periods requested
+    MAX_COMBOS = 50
+    if len(common_keys) > MAX_COMBOS:
+        if all_periods:
+            priority = [k for k in common_keys if "-2026" in k[1]]
+            rest     = [k for k in common_keys if "-2026" not in k[1]]
+            common_keys = (priority + rest)[:MAX_COMBOS]
+        else:
+            common_keys = common_keys[:MAX_COMBOS]
+
     lines = [
-        "=== Comparación de corridas — CU delta ===",
-        f"Corrida A: {label_a}",
-        f"Corrida B: {label_b}",
-        f"(tension_level=2, rate_type=USER | {len(common_keys)} combinaciones en común)",
+        "=== Comparación de corridas — CU y G delta ===",
+        f"Corrida A: {_run_label(run_a)}",
+        f"Corrida B: {_run_label(run_b)}",
+        f"(tension_level=2, rate_type=USER | mostrando {len(common_keys)} de {len(set(idx_a)&set(idx_b))} combinaciones)",
         "",
     ]
 
-    # Group by (market, period) and list all scenarios
-    from itertools import groupby
-    def key2(k): return (k[0], k[1])
-
-    seen = set()
+    # Group by (market, period) — list all scenarios per group
+    seen: set = set()
     for k in common_keys:
-        group_key = key2(k)
-        if group_key in seen:
+        market, period = k[0], k[1]
+        if (market, period) in seen:
             continue
-        seen.add(group_key)
-        market, period = group_key
-        scenarios = [kk[2] for kk in common_keys if key2(kk) == group_key]
+        seen.add((market, period))
+        scenarios = sorted({kk[2] for kk in common_keys if kk[0] == market and kk[1] == period})
         parts = []
-        for sc in sorted(scenarios):
+        for sc in scenarios:
             r_a = idx_a.get((market, period, sc), {})
             r_b = idx_b.get((market, period, sc), {})
-            cu_a = float(r_a.get("cu") or 0)
-            cu_b = float(r_b.get("cu") or 0)
-            delta = round(cu_b - cu_a, 2)
-            sign = f"+{delta}" if delta > 0 else str(delta)
-            parts.append(f"{sc}: A={cu_a} B={cu_b} Δ={sign}")
+            # Fix 2: compare G explicitly, not just CU
+            cu_a = round(float(r_a.get("cu") or 0), 2)
+            cu_b = round(float(r_b.get("cu") or 0), 2)
+            g_a  = round(float(r_a.get("g")  or 0), 2)
+            g_b  = round(float(r_b.get("g")  or 0), 2)
+            dcu  = round(cu_b - cu_a, 2)
+            dg   = round(g_b  - g_a,  2)
+            s_cu = f"+{dcu}" if dcu > 0 else str(dcu)
+            s_g  = f"+{dg}"  if dg  > 0 else str(dg)
+            parts.append(f"{sc}: CU A={cu_a} B={cu_b} Δ={s_cu} | G A={g_a} B={g_b} Δ={s_g}")
         lines.append(f"  {market} | {period} | " + " | ".join(parts))
 
-    log.info("CU COMPARE | run_a=%s run_b=%s common_keys=%d", run_a["id"], run_b["id"], len(common_keys))
+    log.info("CU COMPARE | run_a=%s run_b=%s shown=%d total=%d",
+             run_a["id"], run_b["id"], len(common_keys), len(set(idx_a) & set(idx_b)))
     return "\n".join(lines)
 
 
