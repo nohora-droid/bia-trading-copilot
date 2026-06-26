@@ -69,50 +69,60 @@ def get_claude() -> anthropic.Anthropic:
 
 def _is_duplicate(event_ts: str) -> bool:
     """
-    Returns True if this event_ts was already processed OR if the DB is unavailable.
-    Two-phase check:
-      1. SELECT first — fast path for retries (row already exists → True immediately)
-      2. Upsert with ignore_duplicates — atomic insert; empty result = conflict → True
-    On ANY DB error we return True (block) to prevent triplication from Slack retries.
+    Returns True if this event_ts was already processed.
+    Retry logic for Render cold-start timeouts:
+      - Up to 3 attempts with 1s sleep between them.
+      - Each attempt: SELECT (cheap read) then upsert (atomic insert).
+      - If row already exists at any point → True (block).
+      - If all attempts fail with DB error → False (let through, prefer response over silence).
     """
+    import time
     sb = get_supabase()
-    try:
-        # Phase 1: cheap read — catches Slack retries without a write
-        exists = (
-            sb.table("processed_events")
-            .select("event_ts")
-            .eq("event_ts", event_ts)
-            .limit(1)
-            .execute()
-            .data or []
-        )
-        if exists:
-            log.warning("DUPLICATE BLOCKED (select) | event_ts=%s", event_ts)
-            return True
+    last_err = None
 
-        # Phase 2: atomic insert — winner processes, losers are blocked
-        result = (
-            sb.table("processed_events")
-            .upsert({"event_ts": event_ts}, on_conflict="event_ts", ignore_duplicates=True)
-            .execute()
-        )
-        if not result.data:
-            log.warning("DUPLICATE BLOCKED (upsert) | event_ts=%s", event_ts)
-            return True
-
-        log.info("DEDUP INSERT OK | event_ts=%s", event_ts)
-        # Cleanup stale records — best-effort
+    for attempt in range(3):
         try:
-            cutoff = (datetime.now(timezone.utc) - timedelta(hours=1)).isoformat()
-            sb.table("processed_events").delete().lt("processed_at", cutoff).execute()
-        except Exception:
-            pass
-        return False  # new event — process it
+            # Phase 1: cheap SELECT — fast-path for Slack retries
+            exists = (
+                sb.table("processed_events")
+                .select("event_ts")
+                .eq("event_ts", event_ts)
+                .limit(1)
+                .execute()
+                .data or []
+            )
+            if exists:
+                log.warning("DUPLICATE BLOCKED (select) attempt=%d | event_ts=%s", attempt, event_ts)
+                return True
 
-    except Exception as e:
-        # DB unavailable — let through so the bot responds. Triplication is less bad than silence.
-        log.error("DEDUP ERROR (letting through) | event_ts=%s err=%.200s", event_ts, e)
-        return False
+            # Phase 2: atomic upsert — only one caller wins the insert
+            result = (
+                sb.table("processed_events")
+                .upsert({"event_ts": event_ts}, on_conflict="event_ts", ignore_duplicates=True)
+                .execute()
+            )
+            if not result.data:
+                log.warning("DUPLICATE BLOCKED (upsert) attempt=%d | event_ts=%s", attempt, event_ts)
+                return True
+
+            log.info("DEDUP INSERT OK attempt=%d | event_ts=%s", attempt, event_ts)
+            # Cleanup stale records — best-effort, ignore errors
+            try:
+                cutoff = (datetime.now(timezone.utc) - timedelta(hours=1)).isoformat()
+                sb.table("processed_events").delete().lt("processed_at", cutoff).execute()
+            except Exception:
+                pass
+            return False  # new event — process it
+
+        except Exception as e:
+            last_err = e
+            log.warning("DEDUP attempt=%d failed | event_ts=%s err=%.120s", attempt, event_ts, e)
+            if attempt < 2:
+                time.sleep(1)
+
+    # All 3 attempts failed — let through so bot responds; log clearly
+    log.error("DEDUP all attempts failed (letting through) | event_ts=%s err=%.200s", event_ts, last_err)
+    return False
 
 # ── System Prompt ─────────────────────────────────────────────────────────────
 
@@ -1377,9 +1387,9 @@ def _ctx_cu_compare(run_a: dict, run_b: dict, all_periods: bool = False) -> str:
     """
     sb = get_supabase()
 
-    def _fetch(run: dict) -> dict:
+    def _fetch(run: dict, filter_2026: bool = False) -> dict:
         """Fetch avg CU/G per (market, period, scenario) — max 200 rows."""
-        rows = (
+        q = (
             sb.table("simulation_results")
             .select("market,period,pb_scenario,cu,g,c,t,d,p,r,aj")
             .eq("run_id", run["id"])
@@ -1387,9 +1397,10 @@ def _ctx_cu_compare(run_a: dict, run_b: dict, all_periods: bool = False) -> str:
             .eq("rate_type", "USER")
             .order("period").order("market").order("pb_scenario")
             .limit(200)
-            .execute()
-            .data or []
         )
+        if filter_2026:
+            q = q.ilike("period", "%-2026")
+        rows = q.execute().data or []
         # Average duplicates (same market/period/scenario) in Python
         groups: dict = defaultdict(list)
         for r in rows:
@@ -1402,8 +1413,9 @@ def _ctx_cu_compare(run_a: dict, run_b: dict, all_periods: bool = False) -> str:
             index[key] = {c: _avg(c) for c in ("cu", "g", "c", "t", "d", "p", "r")}
         return index
 
-    idx_a = _fetch(run_a)
-    idx_b = _fetch(run_b)
+    filter_2026 = all_periods  # all_periods=True when question mentions "2026"
+    idx_a = _fetch(run_a, filter_2026=filter_2026)
+    idx_b = _fetch(run_b, filter_2026=filter_2026)
 
     # Fix 1: is_official comes from the simulation_runs row, not simulation_results
     def _run_label(run: dict) -> str:
