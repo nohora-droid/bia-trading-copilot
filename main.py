@@ -110,9 +110,9 @@ def _is_duplicate(event_ts: str) -> bool:
         return False  # new event — process it
 
     except Exception as e:
-        # DB unavailable — block to prevent triplication. Slack will retry later.
-        log.error("DEDUP ERROR (blocking) | event_ts=%s err=%.200s", event_ts, e)
-        return True
+        # DB unavailable — let through so the bot responds. Triplication is less bad than silence.
+        log.error("DEDUP ERROR (letting through) | event_ts=%s err=%.200s", event_ts, e)
+        return False
 
 # ── System Prompt ─────────────────────────────────────────────────────────────
 
